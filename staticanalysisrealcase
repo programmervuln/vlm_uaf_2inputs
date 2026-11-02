@@ -1,0 +1,255 @@
+import re
+import matplotlib.pyplot as plt
+
+# ===================== C代码，带解引用，标准UAF时序：malloc use free use =====================
+C_CODE = r"""
+#include <pthread.h>
+
+void* of_obj = NULL;
+
+void* thread_uninit(void* arg)
+{
+    free(of_obj);
+    return NULL;
+}
+
+void* thread_decode(void* arg)
+{
+    void* tmp = of_obj;
+    *(char*)tmp;
+    return tmp;
+}
+
+int main(void)
+{
+    of_obj = malloc(128);
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, thread_uninit, NULL);
+    pthread_create(&t2, NULL, thread_decode, NULL);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    return 0;
+}
+"""
+
+VAR_ID_MAP = {
+    "of_obj": 1
+}
+
+def filter_comments(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+def identify_functions(code):
+    funcs = []
+    pat = r'([a-zA-Z_*]+)\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{'
+    for m in re.finditer(pat, code):
+        func_name = m.group(2)
+        start_idx = m.end()
+        funcs.append({"name": func_name, "start": start_idx})
+    func_body_map = {}
+    for f in funcs:
+        pos = f["start"]
+        brace = 1
+        while pos < len(code) and brace > 0:
+            if code[pos] == '{':
+                brace += 1
+            elif code[pos] == '}':
+                brace -= 1
+            pos += 1
+        body = code[f["start"]:pos]
+        func_body_map[f["name"]] = body
+    return funcs, func_body_map
+
+def build_single_thread_sequence(func_body_map, func_name):
+    seq = []
+    body = func_body_map[func_name]
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        seq.append((func_name, line))
+    return seq
+
+def extract_malloc(line):
+    pat = r"([A-Za-z_]\w+)\s*=\s*(?:\([^)]*\)\s*)?(malloc|kvmalloc)\s*\("
+    res = []
+    for m in re.findall(pat, line):
+        var = m[0]
+        res.append(f"malloc {var}")
+    return res
+
+def extract_free(line):
+    pat = r"(kfree|kvfree|free)\s*\(\s*([A-Za-z_]\w+)\s*\)"
+    match = re.search(pat, line)
+    if match:
+        return f"free {match.group(2)}"
+    return None
+
+def extract_use_vars(line, blacklist, func_names):
+    use_feats = []
+    line_clean = re.sub(r"\b(?:kfree|kvfree|free)\s*\([^)]*\)", "", line)
+    var_pat = r"\b([A-Za-z_]\w+(?:->|\.[A-Za-z_]\w+)*(?:\[\d*\])?)\b"
+    all_matches = re.findall(var_pat, line_clean)
+    unique_vars = set()
+    for full_expr in all_matches:
+        base_var = re.split(r"->|\.", full_expr)[0]
+        if base_var in blacklist or base_var in func_names or base_var not in VAR_ID_MAP:
+            continue
+        unique_vars.add(base_var)
+    for v in unique_vars:
+        use_feats.append(f"use {v}")
+    return use_feats
+
+def parse_pthread_map(main_seq):
+    create_map = dict()
+    join_map = dict()
+    for idx, (fname, line) in enumerate(main_seq):
+        m_cr = re.search(r'pthread_create\s*\(&(\w+),\s*NULL,\s*(\w+),', line)
+        if m_cr:
+            tvar, worker = m_cr.groups()
+            create_map[worker] = tvar
+        m_jn = re.search(r'pthread_join\s*\((\w+),', line)
+        if m_jn:
+            tvar = m_jn.group(1)
+            join_map[tvar] = idx
+    return create_map, join_map
+
+def interleave_with_pthread_constraint(branches, worker_to_tvar, tvar_join_idx):
+    main_br = branches[0]
+    n_br = len(branches)
+
+    def helper(indices, created_workers):
+        if all(i >= len(b) for i, b in zip(indices, branches)):
+            yield []
+            return
+        for bid in range(n_br):
+            idx = indices[bid]
+            if idx >= len(branches[bid]):
+                continue
+            stmt = branches[bid][idx]
+            fstmt, line = stmt
+            new_indices = indices.copy()
+            new_indices[bid] += 1
+            if bid == 0:
+                new_created = set(created_workers)
+                m_cr = re.search(r'pthread_create\s*\(&(\w+),\s*NULL,\s*(\w+),', line)
+                if m_cr:
+                    _, wname = m_cr.groups()
+                    new_created.add(wname)
+                for rest in helper(new_indices, new_created):
+                    yield [stmt] + rest
+            else:
+                wname = fstmt
+                if wname not in created_workers:
+                    continue
+                tvar = worker_to_tvar.get(wname)
+                if tvar is not None:
+                    j_pos = tvar_join_idx[tvar]
+                    main_ptr = indices[0]
+                    if main_ptr > j_pos:
+                        continue
+                for rest in helper(new_indices, created_workers):
+                    yield [stmt] + rest
+    init_indices = [0]*n_br
+    yield from helper(init_indices, set())
+
+def draw_uaf_flow(feature_list):
+    plt.figure(figsize=(12, 6))
+    ax = plt.gca()
+    for i, feat in enumerate(feature_list):
+        parts = feat.split()
+        act, var = parts[0], parts[1]
+        vid = VAR_ID_MAP[var]
+        x = i * 2
+        if act == "malloc":
+            patch = plt.Circle((x, 0), 0.5, fc="lightcoral", ec="black")
+        elif act == "free":
+            patch = plt.Polygon([[x-0.5,-0.5],[x+0.5,-0.5],[x,0.5]], fc="lightgreen", ec="black")
+        elif act == "use":
+            patch = plt.Rectangle((x-0.5,-0.5),1,1, fc="lightblue", ec="black")
+        else:
+            continue
+        ax.add_patch(patch)
+        plt.text(x,0,str(vid),ha="center",va="center",fontsize=12)
+    plt.xlim(-1, len(feature_list)*2)
+    plt.ylim(-1,1)
+    plt.axis("off")
+    plt.title("UAF Execution Trace: malloc → use → free → use")
+    plt.show()
+
+def is_target_pattern(mem_seq):
+    malloc_idx = None
+    use1_idx = None
+    free_idx = None
+    use2_idx = None
+    for idx, op in enumerate(mem_seq):
+        act, _ = op.split()
+        if act == "malloc" and malloc_idx is None:
+            malloc_idx = idx
+        if malloc_idx is not None and act == "use" and use1_idx is None:
+            use1_idx = idx
+        if use1_idx is not None and act == "free" and free_idx is None:
+            free_idx = idx
+        if free_idx is not None and act == "use" and use2_idx is None:
+            use2_idx = idx
+    return malloc_idx is not None and use1_idx is not None and free_idx is not None and use2_idx is not None \
+        and malloc_idx < use1_idx < free_idx < use2_idx
+
+def main():
+    blacklist = {
+        "int", "char", "float", "double", "void", "long", "short", "unsigned", "signed",
+        "size_t", "u32", "NULL", "malloc", "kvmalloc", "kfree", "kvfree", "free", "sizeof",
+        "struct", "static", "inline", "return", "break",
+        "if", "switch", "case", "for", "while", "else",
+        "pthread_create", "pthread_join", "pthread_t"
+    }
+    raw_code = C_CODE
+    clean_code = filter_comments(raw_code)
+    all_funcs, func_body_dict = identify_functions(clean_code)
+    func_names = {f["name"] for f in all_funcs}
+
+    seq_main    = build_single_thread_sequence(func_body_dict, "main")
+    seq_uninit  = build_single_thread_sequence(func_body_dict, "thread_uninit")
+    seq_decode  = build_single_thread_sequence(func_body_dict, "thread_decode")
+    branches = [seq_main, seq_uninit, seq_decode]
+
+    worker_to_tvar, tvar_join_idx = parse_pthread_map(seq_main)
+    print("======== Thread Branches ========")
+    for tid, br in enumerate(branches):
+        print(f"Branch {tid}: {br}")
+
+    found_trace = None
+    found_mem = None
+    for trace in interleave_with_pthread_constraint(branches, worker_to_tvar, tvar_join_idx):
+        mem_seq = []
+        for f, line in trace:
+            mallocs = extract_malloc(line)
+            mem_seq.extend(mallocs)
+            fr = extract_free(line)
+            if fr:
+                mem_seq.append(fr)
+            uses = extract_use_vars(line, blacklist, func_names)
+            mem_seq.extend(uses)
+        if is_target_pattern(mem_seq):
+            found_trace = trace
+            found_mem = mem_seq
+            break
+
+    if found_trace is not None:
+        print("\n========== Captured UAF Trace ==========")
+        for f, l in found_trace:
+            print(f"[{f}] {l}")
+        print("\n========== Memory Operation Sequence ==========")
+        for m in found_mem:
+            print(m)
+        print(f"\n✅ Trace captured: malloc -> use -> free -> use")
+        draw_uaf_flow(found_mem)
+    else:
+        print("\n❌ Target UAF trace not found")
+
+if __name__ == "__main__":
+    main()
