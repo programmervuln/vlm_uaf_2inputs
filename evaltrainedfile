@@ -1,0 +1,311 @@
+# -*- coding: utf-8 -*-
+"""
+Standalone evaluation script for UAF ViT+CodeBERT+MLP fusion model
+Label: 0=UAF, 1=Non-UAF
+Output: validation_predictions.csv + print precision/recall/f1/acc
+"""
+import os
+import random
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger("eval_uaf_vit_codebert")
+
+# ====================== Same hyperparams & paths as training script ======================
+IMG_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images"
+META_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta"
+CODE_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/genchangename"
+
+OUTPUT_DIR = "./uaf_vit_codebert_mlp"
+BEST_CKPT = os.path.join(OUTPUT_DIR, "best_uaf_vit_codebert_mlp.pth")
+PRED_CSV = os.path.join(OUTPUT_DIR, "eval_validation_predictions.csv")
+
+CODEBERT_NAME = "microsoft/codebert-base"
+NUM_CLASSES = 2
+PROJECTION_DIM = 512
+MAX_CODE_LENGTH = 512
+BATCH_SIZE = 2
+DROPOUT = 0.3
+SEED = 42
+NUM_WORKERS = 0
+
+# ====================== Argparse ======================
+parser = argparse.ArgumentParser()
+parser.add_argument("--ckpt", default=BEST_CKPT, help="path to checkpoint .pth")
+parser.add_argument("--local-codebert", default="", help="local CodeBERT folder")
+args = parser.parse_args()
+
+# ====================== Reproducibility & Device ======================
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ====================== Label parser ======================
+def resolve_label(image_name):
+    if "-0-" in image_name:
+        return 0
+    if "-1-" in image_name:
+        return 1
+    return None
+
+# ====================== Dataset (identical to train script) ======================
+class UAFMultimodalDataset(Dataset):
+    def __init__(
+        self,
+        img_root,
+        meta_root,
+        code_root,
+        is_train,
+        tokenizer,
+        transform,
+        max_length=MAX_CODE_LENGTH
+    ):
+        self.img_paths = []
+        self.code_paths = []
+        self.labels = []
+        self.image_names = []
+        self.sample_ids = []
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.max_length = max_length
+        split_name = "train.txt" if is_train else "val.txt"
+        split_file = os.path.join(meta_root, split_name)
+        if not os.path.isfile(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+        missing_images = 0
+        missing_codes = 0
+        with open(split_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                image_name = line.split(",")[0].strip()
+                label = resolve_label(image_name)
+                if label is None:
+                    logger.warning("Skipping unknown label pattern at %s:%d: %s", split_file, line_no, image_name)
+                    continue
+                image_path = os.path.join(img_root, "uaf", image_name)
+                code_name = image_name.replace("gen", "").replace(".jpg", ".c")
+                code_path = os.path.join(code_root, code_name)
+                if not os.path.isfile(image_path):
+                    missing_images += 1
+                    logger.warning("Image missing: %s", image_path)
+                    continue
+                if not os.path.isfile(code_path):
+                    missing_codes += 1
+                    logger.warning("Code missing: %s", code_path)
+                    continue
+                self.img_paths.append(image_path)
+                self.code_paths.append(code_path)
+                self.labels.append(label)
+                self.image_names.append(image_name)
+                self.sample_ids.append(len(self.sample_ids)+1)
+        if not self.labels:
+            raise ValueError(f"No valid pairs in {split_file}")
+        uaf_count = sum(l == 0 for l in self.labels)
+        non_uaf_count = sum(l == 1 for l in self.labels)
+        logger.info(
+            "%s dataset: %d samples | UAF=0:%d, Non-UAF=1:%d | missing img=%d, missing code=%d",
+            "Train" if is_train else "Val", len(self), uaf_count, non_uaf_count, missing_images, missing_codes
+        )
+    def __len__(self):
+        return len(self.labels)
+    def __getitem__(self, idx):
+        image = Image.open(self.img_paths[idx]).convert("RGB")
+        image_tensor = self.transform(image)
+        with open(self.code_paths[idx], "r", encoding="utf-8", errors="ignore") as f:
+            code_text = f.read()
+        encoded = self.tokenizer(
+            code_text, padding="max_length", truncation=True,
+            max_length=self.max_length, return_tensors="pt"
+        )
+        return {
+            "image": image_tensor,
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+            "sample_id": self.sample_ids[idx],
+            "image_name": self.image_names[idx],
+        }
+
+# ====================== Image Transform ======================
+IMAGE_TRANSFORM = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+])
+
+# ====================== Model (exact same as training) ======================
+class MLPFusionViTCodeBERT(nn.Module):
+    def __init__(
+        self,
+        codebert_name=CODEBERT_NAME,
+        projection_dim=PROJECTION_DIM,
+        dropout=DROPOUT,
+        pretrained_vit=True
+    ):
+        super().__init__()
+        weights = ViT_B_16_Weights.DEFAULT if pretrained_vit else None
+        self.vit = vit_b_16(weights=weights)
+        vit_dim = self.vit.heads.head.in_features
+        self.vit.heads = nn.Identity()
+
+        self.codebert = AutoModel.from_pretrained(codebert_name)
+        code_dim = self.codebert.config.hidden_size
+
+        self.image_projection = nn.Sequential(
+            nn.Linear(vit_dim, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.code_projection = nn.Sequential(
+            nn.Linear(code_dim, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(projection_dim * 2, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, NUM_CLASSES),
+        )
+    def forward(self, images, input_ids, attention_mask):
+        image_raw = self.vit(images)
+        image_feat = self.image_projection(image_raw)
+
+        code_outputs = self.codebert(input_ids=input_ids, attention_mask=attention_mask)
+        token_states = code_outputs.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).to(token_states.dtype)
+        code_raw = (token_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        code_feat = self.code_projection(code_raw)
+
+        fused = torch.cat([image_feat, code_feat], dim=1)
+        logits = self.fusion_mlp(fused)
+        return logits
+
+# ====================== Eval loop ======================
+def evaluate(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+    y_true = []
+    y_pred = []
+    all_probs = []
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Evaluating", leave=False)
+        for batch in pbar:
+            images = batch["image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+
+            logits = model(images, input_ids, attention_mask)
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+
+            probs = torch.softmax(logits, dim=1)
+            preds = probs.argmax(dim=1)
+
+            y_true.extend(labels.cpu().tolist())
+            y_pred.extend(preds.cpu().tolist())
+            all_probs.extend(probs.cpu().numpy())
+
+    metrics = {
+        "loss": total_loss / len(loader),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+    }
+    return metrics, y_true, y_pred, all_probs
+
+# ====================== Save prediction csv ======================
+def dump_csv(model, loader, csv_path):
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Dump predictions", leave=False):
+            images = batch["image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            logits = model(images, input_ids, attention_mask)
+            prob = torch.softmax(logits, dim=1).cpu().numpy()
+            pred = prob.argmax(axis=1)
+            for i in range(len(pred)):
+                gt = int(batch["label"][i])
+                rows.append({
+                    "sample_id": int(batch["sample_id"][i]),
+                    "image_name": batch["image_name"][i],
+                    "ground_truth": gt,
+                    "ground_truth_name": "UAF" if gt == 0 else "Non-UAF",
+                    "prediction": int(pred[i]),
+                    "prediction_name": "UAF" if pred[i]==0 else "Non-UAF",
+                    "prob_uaf": float(prob[i,0]),
+                    "prob_non_uaf": float(prob[i,1]),
+                })
+    pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    logger.info("Eval predictions saved to %s", csv_path)
+
+# ====================== Main ======================
+def main():
+    codebert_name = args.local_codebert.strip() or CODEBERT_NAME
+    logger.info(f"Device: {DEVICE}")
+    logger.info(f"Checkpoint: {args.ckpt}")
+
+    tokenizer = AutoTokenizer.from_pretrained(codebert_name)
+    val_dataset = UAFMultimodalDataset(
+        IMG_ROOT, META_ROOT, CODE_ROOT,
+        is_train=False,
+        tokenizer=tokenizer,
+        transform=IMAGE_TRANSFORM
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
+    )
+    model = MLPFusionViTCodeBERT(codebert_name=codebert_name).to(DEVICE)
+    ckpt = torch.load(args.ckpt, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+    logger.info(f"Loaded checkpoint, best recorded val F1 = {ckpt.get('best_val_f1', -1):.4f}")
+
+    criterion = nn.CrossEntropyLoss()
+    metrics, _, _, _ = evaluate(model, val_loader, criterion)
+    logger.info("="*60)
+    logger.info(
+        "Eval Result | loss=%.4f acc=%.4f precision=%.4f recall=%.4f f1=%.4f",
+        metrics["loss"], metrics["accuracy"], metrics["precision"], metrics["recall"], metrics["f1"]
+    )
+    logger.info("="*60)
+    dump_csv(model, val_loader, PRED_CSV)
+
+if __name__ == "__main__":
+    main()
