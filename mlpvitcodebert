@@ -1,0 +1,1004 @@
+# -*- coding: utf-8 -*-
+"""
+UAF-only dataset version: ViT + CodeBERT + MLP fusion.
+Add: real-time batch accuracy on tqdm progress bar.
+
+Dataset paths and label conventions follow the supplied SimpleVLM program:
+  image:      IMG_ROOT/uaf/<image filename from train.txt or val.txt>
+  code:       CODE_ROOT/<image filename with 'gen' removed and .jpg -> .c>
+  split/label META_ROOT/train.txt and META_ROOT/val.txt
+  label 0 = UAF; label 1 = Non-UAF
+
+Model forward inputs are image pixels + source-code token IDs + attention mask.
+Ground-truth labels are used only for loss and evaluation, never as model inputs.
+"""
+
+import os
+import random
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
+from tqdm import tqdm
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger("uaf_vit_codebert_mlp")
+
+
+# ============================================================
+# 1. UAF dataset paths
+# ============================================================
+
+IMG_ROOT = (
+    "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images"
+)
+META_ROOT = (
+    "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta"
+)
+CODE_ROOT = (
+    "/zhangliqiang/clip/copyfolder/vlm0/genchangename"
+)
+
+OUTPUT_DIR = "./uaf_vit_codebert_mlp"
+
+BEST_CKPT = os.path.join(
+    OUTPUT_DIR,
+    "best_uaf_vit_codebert_mlp.pth"
+)
+
+PRED_CSV = os.path.join(
+    OUTPUT_DIR,
+    "validation_predictions.csv"
+)
+
+
+# ============================================================
+# 2. Training configuration
+# ============================================================
+
+CODEBERT_NAME = "microsoft/codebert-base"
+
+NUM_CLASSES = 2
+
+# Both image and code features are projected to 512 dimensions.
+PROJECTION_DIM = 512
+
+# CodeBERT input sequence length.
+MAX_CODE_LENGTH = 512
+
+BATCH_SIZE = 2
+EPOCHS = 15
+
+LR = 2e-5
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.3
+
+PATIENCE = 4
+SEED = 42
+NUM_WORKERS = 0
+
+
+# ============================================================
+# 3. Command-line arguments
+# ============================================================
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--eval-only",
+    action="store_true",
+    help="Evaluate the saved best checkpoint"
+)
+
+parser.add_argument(
+    "--local-codebert",
+    default="",
+    help="Optional local CodeBERT model/tokenizer directory"
+)
+
+args = parser.parse_args()
+
+
+# ============================================================
+# 4. Reproducibility and device
+# ============================================================
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# 5. Label parsing
+# ============================================================
+
+def resolve_label(image_name):
+    """
+    Keep label mapping consistent with the supplied UAF program.
+
+    Label 0 = UAF
+    Label 1 = Non-UAF
+
+    Labels are supervision targets only, not model inputs.
+    """
+
+    if "-0-" in image_name:
+        return 0
+
+    if "-1-" in image_name:
+        return 1
+
+    return None
+
+
+# ============================================================
+# 6. UAF multimodal dataset
+# ============================================================
+
+class UAFMultimodalDataset(Dataset):
+
+    def __init__(
+        self,
+        img_root,
+        meta_root,
+        code_root,
+        is_train,
+        tokenizer,
+        transform,
+        max_length=MAX_CODE_LENGTH
+    ):
+
+        self.img_paths = []
+        self.code_paths = []
+        self.labels = []
+        self.image_names = []
+        self.sample_ids = []
+
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.max_length = max_length
+
+        split_name = (
+            "train.txt" if is_train else "val.txt"
+        )
+
+        split_file = os.path.join(
+            meta_root,
+            split_name
+        )
+
+        if not os.path.isfile(split_file):
+            raise FileNotFoundError(
+                f"Split file not found: {split_file}"
+            )
+
+        missing_images = 0
+        missing_codes = 0
+
+        with open(
+            split_file,
+            "r",
+            encoding="utf-8",
+            errors="ignore"
+        ) as f:
+
+            for line_no, line in enumerate(f, start=1):
+
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                # First field contains the image filename.
+                image_name = line.split(",")[0].strip()
+
+                label = resolve_label(image_name)
+
+                if label is None:
+                    logger.warning(
+                        "Skipping unknown label pattern "
+                        "at %s:%d: %s",
+                        split_file,
+                        line_no,
+                        image_name
+                    )
+                    continue
+
+                # UAF images are stored under images/uaf/.
+                image_path = os.path.join(
+                    img_root,
+                    "uaf",
+                    image_name
+                )
+
+                # Match the naming convention used by the
+                # supplied UAF SimpleVLM program.
+                code_name = (
+                    image_name
+                    .replace("gen", "")
+                    .replace(".jpg", ".c")
+                )
+
+                code_path = os.path.join(
+                    code_root,
+                    code_name
+                )
+
+                if not os.path.isfile(image_path):
+                    missing_images += 1
+
+                    logger.warning(
+                        "Image missing: %s",
+                        image_path
+                    )
+                    continue
+
+                if not os.path.isfile(code_path):
+                    missing_codes += 1
+
+                    logger.warning(
+                        "Code missing: %s",
+                        code_path
+                    )
+                    continue
+
+                self.img_paths.append(image_path)
+                self.code_paths.append(code_path)
+                self.labels.append(label)
+                self.image_names.append(image_name)
+
+                self.sample_ids.append(
+                    len(self.sample_ids) + 1
+                )
+
+        if not self.labels:
+            raise ValueError(
+                f"No valid image/code pairs found in "
+                f"{split_file}. Check IMG_ROOT, META_ROOT, "
+                "CODE_ROOT, filenames, and image-to-code naming."
+            )
+
+        uaf_count = sum(
+            label == 0 for label in self.labels
+        )
+
+        non_uaf_count = sum(
+            label == 1 for label in self.labels
+        )
+
+        logger.info(
+            "%s dataset: %d samples | "
+            "UAF(label 0)=%d | Non-UAF(label 1)=%d | "
+            "missing images=%d | missing code files=%d",
+            "Train" if is_train else "Validation",
+            len(self),
+            uaf_count,
+            non_uaf_count,
+            missing_images,
+            missing_codes
+        )
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+
+        # ---------------- Image input ----------------
+
+        image = Image.open(
+            self.img_paths[idx]
+        ).convert("RGB")
+
+        image_tensor = self.transform(image)
+
+        # ---------------- Source-code input ----------------
+
+        with open(
+            self.code_paths[idx],
+            "r",
+            encoding="utf-8",
+            errors="ignore"
+        ) as f:
+            code_text = f.read()
+
+        encoded = self.tokenizer(
+            code_text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+
+        # Label is returned separately for loss and evaluation.
+        # It is never passed into model.forward().
+        return {
+            "image": image_tensor,
+
+            "input_ids": (
+                encoded["input_ids"].squeeze(0)
+            ),
+
+            "attention_mask": (
+                encoded["attention_mask"].squeeze(0)
+            ),
+
+            "label": torch.tensor(
+                self.labels[idx],
+                dtype=torch.long
+            ),
+
+            "sample_id": self.sample_ids[idx],
+
+            "image_name": self.image_names[idx],
+        }
+
+
+# ============================================================
+# 7. Image preprocessing
+# ============================================================
+
+# ImageNet normalization for pretrained torchvision ViT.
+
+IMAGE_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225)
+    ),
+])
+
+
+# ============================================================
+# 8. ViT + CodeBERT + MLP fusion model
+# ============================================================
+
+class MLPFusionViTCodeBERT(nn.Module):
+    """
+    Two model modalities:
+        1. MLG image
+        2. Source code
+
+    Ground-truth labels are not accepted by forward().
+    """
+
+    def __init__(
+        self,
+        codebert_name=CODEBERT_NAME,
+        projection_dim=PROJECTION_DIM,
+        dropout=DROPOUT,
+        pretrained_vit=True
+    ):
+
+        super().__init__()
+
+        # ---------------- Image encoder: ViT ----------------
+
+        weights = (
+            ViT_B_16_Weights.DEFAULT
+            if pretrained_vit
+            else None
+        )
+
+        self.vit = vit_b_16(weights=weights)
+
+        vit_dim = self.vit.heads.head.in_features
+
+        # Remove the original ImageNet classification head.
+        self.vit.heads = nn.Identity()
+
+        # ---------------- Code encoder: CodeBERT ----------------
+
+        self.codebert = AutoModel.from_pretrained(
+            codebert_name
+        )
+
+        code_dim = self.codebert.config.hidden_size
+
+        # ---------------- Image projection ----------------
+
+        self.image_projection = nn.Sequential(
+            nn.Linear(
+                vit_dim,
+                projection_dim
+            ),
+
+            nn.LayerNorm(projection_dim),
+
+            nn.GELU(),
+
+            nn.Dropout(dropout),
+        )
+
+        # ---------------- Code projection ----------------
+
+        self.code_projection = nn.Sequential(
+            nn.Linear(
+                code_dim,
+                projection_dim
+            ),
+
+            nn.LayerNorm(projection_dim),
+
+            nn.GELU(),
+
+            nn.Dropout(dropout),
+        )
+
+        # ---------------- MLP fusion classifier ----------------
+        #
+        # Image feature: 512 dimensions
+        # Code feature:  512 dimensions
+        # Concatenated: 1024 dimensions
+        #
+        # MLP:
+        # 1024 -> 512 -> 256 -> 2
+
+        self.fusion_mlp = nn.Sequential(
+
+            nn.Linear(
+                projection_dim * 2,
+                512
+            ),
+
+            nn.LayerNorm(512),
+
+            nn.GELU(),
+
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                512,
+                256
+            ),
+
+            nn.LayerNorm(256),
+
+            nn.GELU(),
+
+            nn.Dropout(dropout),
+
+            nn.Linear(
+                256,
+                NUM_CLASSES
+            ),
+        )
+
+    def forward(
+        self,
+        images,
+        input_ids,
+        attention_mask
+    ):
+        """
+        Inputs:
+            images:
+                [batch, 3, 224, 224]
+
+            input_ids:
+                [batch, MAX_CODE_LENGTH]
+
+            attention_mask:
+                [batch, MAX_CODE_LENGTH]
+
+        Output:
+            logits:
+                [batch, 2]
+
+        Class indices:
+            0 = UAF
+            1 = Non-UAF
+        """
+
+        # ---------------- Image feature extraction ----------------
+
+        image_raw = self.vit(images)
+
+        image_feat = self.image_projection(
+            image_raw
+        )
+
+        # ---------------- Code feature extraction ----------------
+
+        code_outputs = self.codebert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        token_states = code_outputs.last_hidden_state
+
+        # Masked mean pooling over valid code tokens.
+        # Padding tokens do not contribute to the mean.
+
+        mask = attention_mask.unsqueeze(-1).to(
+            token_states.dtype
+        )
+
+        code_raw = (
+            (token_states * mask).sum(dim=1)
+            /
+            mask.sum(dim=1).clamp(min=1.0)
+        )
+
+        code_feat = self.code_projection(
+            code_raw
+        )
+
+        # ---------------- Feature concatenation ----------------
+
+        fused = torch.cat(
+            [image_feat, code_feat],
+            dim=1
+        )
+
+        # ---------------- MLP classification ----------------
+
+        logits = self.fusion_mlp(fused)
+
+        return logits
+
+
+# ============================================================
+# 9. Training and evaluation epoch (MODIFIED: real-time acc)
+# ============================================================
+
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    desc=""
+):
+
+    training = optimizer is not None
+
+    model.train(training)
+
+    total_loss = 0.0
+
+    y_true = []
+    y_pred = []
+    correct = 0
+    total_samples = 0
+
+    with torch.set_grad_enabled(training):
+        pbar = tqdm(loader, desc=desc, leave=False)
+        for batch in pbar:
+
+            images = batch["image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+
+            batch_size = labels.size(0)
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+
+            logits = model(images, input_ids, attention_mask)
+            loss = criterion(logits, labels)
+
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            total_loss += loss.item()
+            preds = logits.argmax(dim=1)
+
+            # accumulate for real-time acc
+            correct += (preds == labels).sum().item()
+            total_samples += batch_size
+            current_acc = correct / total_samples
+
+            y_pred.extend(preds.detach().cpu().tolist())
+            y_true.extend(labels.detach().cpu().tolist())
+
+            # update progress bar suffix
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{current_acc:.4f}"
+            })
+
+    metrics = {
+        "loss": total_loss / max(1, len(loader)),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+    }
+
+    return metrics
+
+
+# ============================================================
+# 10. Save validation predictions
+# ============================================================
+
+def save_predictions(model, loader):
+
+    model.eval()
+
+    rows = []
+
+    with torch.no_grad():
+
+        for batch in tqdm(
+            loader,
+            desc="Predict",
+            leave=False
+        ):
+
+            images = batch["image"].to(
+                DEVICE
+            )
+
+            input_ids = batch[
+                "input_ids"
+            ].to(DEVICE)
+
+            attention_mask = batch[
+                "attention_mask"
+            ].to(DEVICE)
+
+            logits = model(
+                images,
+                input_ids,
+                attention_mask
+            )
+
+            probabilities = torch.softmax(
+                logits,
+                dim=1
+            ).cpu().numpy()
+
+            predictions = probabilities.argmax(
+                axis=1
+            )
+
+            for i, prediction in enumerate(
+                predictions
+            ):
+
+                true_label = int(
+                    batch["label"][i]
+                )
+
+                rows.append({
+
+                    "sample_id": int(
+                        batch["sample_id"][i]
+                    ),
+
+                    "image_name": (
+                        batch["image_name"][i]
+                    ),
+
+                    "ground_truth": true_label,
+
+                    "ground_truth_name": (
+                        "UAF"
+                        if true_label == 0
+                        else "Non-UAF"
+                    ),
+
+                    "prediction": int(
+                        prediction
+                    ),
+
+                    "prediction_name": (
+                        "UAF"
+                        if prediction == 0
+                        else "Non-UAF"
+                    ),
+
+                    "prob_uaf": float(
+                        probabilities[i, 0]
+                    ),
+
+                    "prob_non_uaf": float(
+                        probabilities[i, 1]
+                    ),
+                })
+
+    pd.DataFrame(rows).to_csv(
+        PRED_CSV,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    logger.info(
+        "Predictions saved to %s",
+        PRED_CSV
+    )
+
+
+# ============================================================
+# 11. Main training function
+# ============================================================
+
+def main():
+
+    codebert_name = (
+        args.local_codebert.strip()
+        or CODEBERT_NAME
+    )
+
+    logger.info(
+        "Device: %s",
+        DEVICE
+    )
+
+    logger.info(
+        "Image root: %s/uaf",
+        IMG_ROOT
+    )
+
+    logger.info(
+        "Metadata root: %s",
+        META_ROOT
+    )
+
+    logger.info(
+        "Code root: %s",
+        CODE_ROOT
+    )
+
+    logger.info(
+        "Output root: %s",
+        OUTPUT_DIR
+    )
+
+    logger.info(
+        "Label convention: 0=UAF, 1=Non-UAF"
+    )
+
+    # ---------------- Tokenizer ----------------
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        codebert_name
+    )
+
+    # ---------------- Datasets ----------------
+
+    train_dataset = UAFMultimodalDataset(
+        IMG_ROOT,
+        META_ROOT,
+        CODE_ROOT,
+        True,
+        tokenizer,
+        IMAGE_TRANSFORM
+    )
+
+    val_dataset = UAFMultimodalDataset(
+        IMG_ROOT,
+        META_ROOT,
+        CODE_ROOT,
+        False,
+        tokenizer,
+        IMAGE_TRANSFORM
+    )
+
+    # ---------------- Data loaders ----------------
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available()
+    )
+
+    # ---------------- Model ----------------
+
+    model = MLPFusionViTCodeBERT(
+        codebert_name=codebert_name
+    ).to(DEVICE)
+
+    # Two-class logits + CrossEntropyLoss.
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    # ========================================================
+    # Evaluation-only mode
+    # ========================================================
+
+    if args.eval_only:
+
+        if not os.path.isfile(BEST_CKPT):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {BEST_CKPT}"
+            )
+
+        checkpoint = torch.load(
+            BEST_CKPT,
+            map_location=DEVICE
+        )
+
+        model.load_state_dict(
+            checkpoint["model_state"]
+        )
+
+    # ========================================================
+    # Training mode
+    # ========================================================
+
+    else:
+
+        best_f1 = -1.0
+        stale_epochs = 0
+
+        for epoch in range(EPOCHS):
+
+            # ---------------- Training ----------------
+
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                desc=f"Train {epoch + 1}/{EPOCHS}"
+            )
+
+            # ---------------- Validation ----------------
+
+            val_metrics = run_epoch(
+                model,
+                val_loader,
+                criterion,
+                desc=f"Val {epoch + 1}/{EPOCHS}"
+            )
+
+            logger.info(
+                "Epoch %02d/%02d | "
+                "train loss=%.4f acc=%.4f F1=%.4f | "
+                "val loss=%.4f "
+                "precision=%.4f recall=%.4f F1=%.4f",
+
+                epoch + 1,
+                EPOCHS,
+
+                train_metrics["loss"],
+                train_metrics["accuracy"],
+                train_metrics["f1"],
+
+                val_metrics["loss"],
+                val_metrics["accuracy"],
+                val_metrics["precision"],
+                val_metrics["recall"],
+                val_metrics["f1"]
+            )
+
+            # ---------------- Save best model ----------------
+
+            if val_metrics["f1"] > best_f1:
+
+                best_f1 = val_metrics["f1"]
+
+                stale_epochs = 0
+
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+
+                        "epoch": epoch + 1,
+
+                        "best_val_f1": best_f1,
+
+                        "label_mapping": {
+                            "0": "UAF",
+                            "1": "Non-UAF"
+                        },
+                    },
+                    BEST_CKPT
+                )
+
+                logger.info(
+                    "Saved best checkpoint: %s",
+                    BEST_CKPT
+                )
+
+            else:
+
+                stale_epochs += 1
+
+                if stale_epochs >= PATIENCE:
+
+                    logger.info(
+                        "Early stopping after %d stale epochs",
+                        PATIENCE
+                    )
+
+                    break
+
+        # ---------------- Reload best checkpoint ----------------
+
+        checkpoint = torch.load(
+            BEST_CKPT,
+            map_location=DEVICE
+        )
+
+        model.load_state_dict(
+            checkpoint["model_state"]
+        )
+
+        logger.info(
+            "Best epoch=%s, best validation F1=%.4f",
+            checkpoint.get("epoch"),
+            checkpoint.get(
+                "best_val_f1",
+                float("nan")
+            )
+        )
+
+    # ========================================================
+    # 12. Final validation and prediction export
+    # ========================================================
+
+    val_metrics = run_epoch(
+        model,
+        val_loader,
+        criterion,
+        desc="Final validation"
+    )
+
+    logger.info(
+        "Final validation metrics: %s",
+        val_metrics
+    )
+
+    save_predictions(
+        model,
+        val_loader
+    )
+
+
+# ============================================================
+# 13. Entry point
+# ============================================================
+
+if __name__ == "__main__":
+    main()
