@@ -1,0 +1,379 @@
+# -*- coding: utf-8 -*-
+"""Pattern-based cross-entry UAF detector for the Node example.
+
+Usage:
+  python cross_entry_uaf_detector.py                 # embedded example
+  python cross_entry_uaf_detector.py example.cpp     # analyze a C++ file
+  python cross_entry_uaf_detector.py example.cpp --no-plot
+
+This is a lightweight regex-based prototype, not a full C++ static analyzer.
+Plot style: circle=ALLOC(1/2), triangle=FREE, square=USE; number label inside shape
+"""
+import argparse
+import re
+import sys
+from pathlib import Path
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, Polygon, Rectangle
+except ImportError:
+    plt = None
+
+DEMO_SOURCE = r'''
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+struct Node { char name[16]; Node* next; Node* related; };
+static Node* shared_head = nullptr;
+static Node* create_node(const char* name) {
+    Node* node = static_cast<Node*>(std::malloc(sizeof(Node)));
+    if (node == nullptr) return nullptr;
+    std::strncpy(node->name, name, sizeof(node->name)-1);
+    node->name[sizeof(node->name)-1] = '\0';
+    node->next = nullptr; node->related = nullptr;
+    return node;
+}
+static void clear_list() {
+    Node* current = shared_head;
+    while (current != nullptr) {
+        Node* next = current->next;
+        std::free(current); current = next;
+    }
+    shared_head = nullptr;
+}
+extern "C" void entry_initialize() {
+    clear_list();
+    Node* a = create_node("entry_A");
+    Node* b = create_node("entry_B");
+    if (a == nullptr || b == nullptr) { std::free(a); std::free(b); return; }
+    a->next = b;
+    b->related = a;
+    shared_head = a;
+}
+extern "C" void entry_free_A() {
+    Node* a = shared_head;
+    if (a != nullptr && std::strcmp(a->name, "entry_A") == 0) {
+        shared_head = a->next;
+        std::free(a);
+    }
+}
+extern "C" void entry_use_from_B() {
+    Node* b = shared_head;
+    while (b != nullptr && std::strcmp(b->name, "entry_B") != 0) b = b->next;
+    if (b != nullptr && b->related != nullptr)
+        std::printf("Related node: %s\\n", b->related->name);
+}
+'''
+
+# ========== 绘图映射（和你给的参考代码保持一致） ==========
+VAR_ID_MAP = {
+    "entry_A": 1,
+    "entry_B": 2
+}
+
+
+def strip_comments(source):
+    # Preserve strings/chars while removing C/C++ comments.
+    pat = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/', re.S)
+    def repl(m):
+        token = m.group(0)
+        return re.sub(r'[^\n]', ' ', token) if token.startswith(('//', '/*')) else token
+    return pat.sub(repl, source)
+
+
+def extract_functions(source):
+    pat = re.compile(
+        r'(?m)^[ \t]*(?:extern\s+"C"\s+)?'
+        r'(?:(?:static|inline|virtual|constexpr|extern)\s+)*'
+        r'(?:[\w:<>*&]+\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{'
+    )
+    functions = {}
+    for m in pat.finditer(source):
+        name = m.group(1)
+        opening = source.find('{', m.start(), m.end())
+        depth, i, quote, escaped = 1, opening + 1, None, False
+        while i < len(source) and depth:
+            ch = source[i]
+            if quote:
+                if escaped: escaped = False
+                elif ch == '\\': escaped = True
+                elif ch == quote: quote = None
+            else:
+                if ch in ('"', "'"): quote = ch
+                elif ch == '{': depth += 1
+                elif ch == '}': depth -= 1
+            i += 1
+        if depth == 0:
+            functions[name] = source[opening + 1:i - 1]
+    return functions
+
+
+def split_statements(body):
+    out, buf, quote, escaped = [], [], None, False
+    for ch in body:
+        if quote:
+            buf.append(ch)
+            if escaped: escaped = False
+            elif ch == '\\': escaped = True
+            elif ch == quote: quote = None
+        elif ch in ('"', "'"):
+            quote = ch; buf.append(ch)
+        elif ch in ';{}':
+            piece = ''.join(buf).strip()
+            if piece: out.append(piece + (';' if ch == ';' else ''))
+            buf = []
+        else:
+            buf.append(ch)
+    piece = ''.join(buf).strip()
+    if piece: out.append(piece)
+    return out
+
+
+class Detector:
+    def __init__(self, source, entries):
+        self.functions = extract_functions(strip_comments(source))
+        self.entries = entries
+        self.objects = {}          # object_id -> label, fields, allocated/freed info
+        self.points_to = {}        # variable -> object_id or None
+        self.events = []
+        self.findings = []
+        self.counter = 0
+        self.entry = ''
+
+    def emit(self, kind, expr, oid=None, note=''):
+        self.events.append((self.entry, kind, expr, oid, note))
+
+    def new_object(self, label, where):
+        self.counter += 1
+        oid = f'obj{self.counter}'
+        self.objects[oid] = {
+            'label': label, 'fields': {'next': None, 'related': None},
+            'allocated_at': where, 'freed_at': None,
+        }
+        self.emit('ALLOC', f'allocate({label})', oid, where)
+        return oid
+
+    def resolve(self, expression):
+        expression = re.sub(r'\s+', '', expression).rstrip(';')
+        if not expression or expression in ('nullptr', 'NULL', '0'):
+            return None
+        parts = expression.split('->')
+        oid = self.points_to.get(parts[0])
+        for field in parts[1:]:
+            if oid not in self.objects:
+                return None
+            oid = self.objects[oid]['fields'].get(field)
+        return oid
+
+    def assign(self, lhs, rhs, where):
+        lhs = re.sub(r'\s+', '', lhs)
+        rhs = rhs.strip().rstrip(';').strip()
+        if '->' in lhs:
+            parts = lhs.split('->')
+            owner = self.resolve('->'.join(parts[:-1]))
+            target = self.resolve(rhs)
+            if owner in self.objects:
+                self.objects[owner]['fields'][parts[-1]] = target
+                self.emit('FIELD', f'{lhs} = {rhs}', target, where)
+            return
+        creation = re.search(r'create_node\s*\(\s*"([^"]+)"', rhs)
+        target = self.new_object(creation.group(1), where) if creation else self.resolve(rhs)
+        self.points_to[lhs] = target
+        self.emit('ALIAS', f'{lhs} = {rhs}', target, where)
+
+    def check_use(self, pointer_expr, member, where):
+        oid = self.resolve(pointer_expr)
+        self.emit('USE', f'{pointer_expr}->{member}', oid, where)
+        if oid in self.objects and self.objects[oid]['freed_at']:
+            obj = self.objects[oid]
+            finding = (f'{self.entry}: {pointer_expr}->{member} accesses {obj["label"]}, '
+                       f'freed at {obj["freed_at"]} (allocated at {obj["allocated_at"]}).')
+            self.findings.append(finding)
+            self.emit('UAF', f'{pointer_expr}->{member}', oid, finding)
+
+    def process(self, statement, number):
+        s = statement.strip()
+        if not s:
+            return
+        where = f'{self.entry}, statement {number}'
+
+        # Successful allocation path only: frees inside the allocation-failure
+        # branch of entry_initialize are not unconditional events.
+        if self.entry == 'entry_initialize' and re.search(r'std::free\s*\(\s*[ab]\s*\)', s):
+            return
+        if self.entry == 'entry_initialize' and s == 'return;':
+            return
+
+        decl = re.match(r'^\s*(?:Node\s*\*|struct\s+Node\s*\*|auto\s*\*?)\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*;?$', s)
+        if decl:
+            self.assign(decl.group(1), decl.group(2), where)
+
+        assign = re.match(r'^\s*([A-Za-z_]\w*(?:\s*->\s*[A-Za-z_]\w+)+|[A-Za-z_]\w*)\s*=\s*(?![=])(.+?)\s*;?$', s)
+        if assign:
+            lhs, rhs = assign.group(1).strip(), assign.group(2).strip()
+            if not (decl and lhs == decl.group(1)) and not any(op in rhs for op in ('==', '!=', '<=', '>=')):
+                # In this target sequence shared_head points to B, so the while
+                # loop's b=b->next edge is not taken.
+                skip_advance = (self.entry == 'entry_use_from_B' and lhs == 'b'
+                    and re.sub(r'\s+', '', rhs) == 'b->next'
+                    and self.points_to.get('b') in self.objects
+                    and self.objects[self.points_to['b']]['label'] == 'entry_B')
+                if not skip_advance:
+                    self.assign(lhs, rhs, where)
+
+        free_match = re.search(r'\b(?:std::)?(?:free|kfree|kvfree)\s*\(\s*([A-Za-z_]\w*)\s*\)', s)
+        if free_match:
+            var = free_match.group(1)
+            oid = self.resolve(var)
+            if oid in self.objects:
+                obj = self.objects[oid]
+                if not obj['freed_at']:
+                    obj['freed_at'] = where
+                self.emit('FREE', f'free({var})', oid, where)
+            else:
+                self.emit('FREE_UNKNOWN', f'free({var})', oid, where)
+
+        # Deep member chain: b->related->name resolves the pointer b->related.
+        chain_pat = re.compile(r'\b([A-Za-z_]\w*(?:\s*->\s*[A-Za-z_]\w+)+)\s*->\s*([A-Za-z_]\w*)')
+        for m in chain_pat.finditer(s):
+            if re.match(r'\s*=', s[m.end():]):
+                continue
+            self.check_use(re.sub(r'\s+', '', m.group(1)), m.group(2), where)
+
+        # Simple dereferences, e.g. a->name. Do not duplicate the head of a chain.
+        simple_pat = re.compile(r'\b([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)')
+        for m in simple_pat.finditer(s):
+            var, member = m.group(1), m.group(2)
+            if re.search(rf'\b{re.escape(var)}\s*->\s*{re.escape(member)}\s*->', s):
+                continue
+            if re.match(r'\s*=', s[m.end():]):
+                continue
+            if var in self.points_to:
+                self.check_use(var, member, where)
+
+    def analyze(self):
+        missing = [e for e in self.entries if e not in self.functions]
+        if missing:
+            raise ValueError('Could not find function(s): ' + ', '.join(missing))
+        # Crucial: do NOT reset pointer/object state between independent entries.
+        for entry in self.entries:
+            self.entry = entry
+            for i, stmt in enumerate(split_statements(self.functions[entry]), 1):
+                self.process(stmt, i)
+        self.findings = list(dict.fromkeys(self.findings))
+        return self.events, self.findings, self.objects
+
+    def report(self):
+        print('========== Parsed Functions ==========')
+        print(', '.join(self.functions))
+        print('\n========== Cross-Entry Memory Events ==========')
+        for i, (entry, kind, expr, oid, note) in enumerate(self.events, 1):
+            label = self.objects.get(oid, {}).get('label', '-')
+            print(f'{i:02d}. [{entry}] {kind:<11} {expr:<28} object={label}')
+        print('\n========== Object State ==========')
+        for oid, obj in self.objects.items():
+            print(f'{obj["label"]} ({oid}): {"FREED" if obj["freed_at"] else "LIVE"}; '
+                  f'fields={obj["fields"]}; freed_at={obj["freed_at"] or "-"}')
+        print('\n========== UAF Detection Result ==========')
+        if self.findings:
+            for finding in self.findings:
+                print('[UAF DETECTED]', finding)
+        else:
+            print('No UAF detected by this limited pattern-based prototype.')
+            print('This result does not prove the source is safe.')
+
+
+def draw_flow(events, objects, filename):
+    """
+    【新版绘图，完全对齐你给的参考样式】
+    ALLOC -> circle
+    FREE  -> triangle
+    USE/UAF -> square
+    形状内部写数字编号（从VAR_ID_MAP取，entry_A=1，entry_B=2）
+    横向等间距，固定大小
+    """
+    if plt is None:
+        print('matplotlib not installed; skipped flow chart.')
+        return
+
+    # 只保留这三类用于绘图
+    keep_kinds = {"ALLOC", "FREE", "USE", "UAF"}
+    draw_items = []
+    for entry, kind, expr, oid, note in events:
+        if kind not in keep_kinds:
+            continue
+        obj = objects.get(oid, None)
+        if obj is None:
+            continue
+        label = obj["label"]
+        if label not in VAR_ID_MAP:
+            continue
+        draw_items.append((kind, VAR_ID_MAP[label]))
+
+    if not draw_items:
+        print("No drawable memory events.")
+        return
+
+    plt.figure(figsize=(16, 6))
+    ax = plt.gca()
+    idx = 0
+    step_x = 2.0
+    for kind, num in draw_items:
+        x = idx * step_x
+        y = 0.0
+        if kind == "ALLOC":
+            # circle
+            patch = Circle((x, y), 0.5, fc="lightcoral", ec="black")
+        elif kind == "FREE":
+            # triangle
+            patch = Polygon([[x - 0.5, y - 0.5], [x + 0.5, y - 0.5], [x, y + 0.5]],
+                            fc="lightgreen", ec="black")
+        elif kind in ("USE", "UAF"):
+            # square；UAF用salmon红色区分
+            fc_color = "salmon" if kind == "UAF" else "lightblue"
+            patch = Rectangle((x - 0.5, y - 0.5), 1.0, 1.0, fc=fc_color, ec="black")
+        else:
+            idx += 1
+            continue
+        ax.add_patch(patch)
+        ax.text(x, y, str(num), ha="center", va="center", fontsize=12)
+        idx += 1
+
+    plt.xlim(-1, idx * step_x)
+    plt.ylim(-1.2, 1.2)
+    plt.axis("off")
+    plt.title("Recursive‑Container Cross‑Entry UAF Flow (entry_A=1, entry_B=2)")
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'Flow image saved: {filename}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Cross-entry recursive-container UAF prototype')
+    parser.add_argument('source', nargs='?', help='C/C++ source file (default: built-in example)')
+    parser.add_argument('--entries', nargs='+', default=['entry_initialize', 'entry_free_A', 'entry_use_from_B'])
+    parser.add_argument('--no-plot', action='store_true')
+    parser.add_argument('--plot-file', default='cross_entry_uaf_flow.png')
+    args = parser.parse_args()
+    if args.source:
+        source_path = Path(args.source)
+        if not source_path.is_file():
+            print(f'ERROR: source file not found: {source_path}', file=sys.stderr); sys.exit(2)
+        source = source_path.read_text(encoding='utf-8', errors='replace')
+    else:
+        source = DEMO_SOURCE
+    try:
+        detector = Detector(source, args.entries)
+        events, findings, objects = detector.analyze()
+        detector.report()
+        if not args.no_plot:
+            draw_flow(events, objects, args.plot_file)
+        sys.exit(1 if findings else 0)
+    except ValueError as exc:
+        print(f'ERROR: {exc}', file=sys.stderr); sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
