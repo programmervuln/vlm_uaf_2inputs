@@ -1,0 +1,697 @@
+# -*- coding: utf-8 -*-
+"""
+MLG-UAF Ablation Framework
+Support all ablation variants in the ablation table via --arch-id argument.
+All variants share ViT-B/16 visual encoder + projection + concat MLP fusion head.
+Ablation list:
+ 0: Full MLG-UAF (6 Longformer + 4 MoBA)
+ 1: Replace MLG with CFG
+ 2: Replace MLG with PDG
+ 3: Replace MLG with DFG
+ 4: without the full MLG CLIP visual branch
+ 5: Pure Longformer (10 layers, static sliding)
+ 6: Pure MoBA (10 layers)
+ 7: 6 Longformer + 4 Static Sliding Attention
+ 8: 8 Longformer + 2 MoBA
+ 9: 4 Longformer + 6 MoBA
+10: without Auxiliary Union-Find Alias
+11: Only Auxiliary Alias Module
+Label convention: 0 = UAF, 1 = Non-UAF
+"""
+
+import os
+import random
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+from transformers import AutoTokenizer, LongformerModel
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
+from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s"
+)
+logger = logging.getLogger("mlg_uaf_ablation_switch")
+
+
+# ============================================================
+# Path Config
+# ============================================================
+IMG_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images"
+META_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta"
+CODE_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/genchangename"
+
+OUTPUT_DIR = "./mlg_uaf_ablation"
+BEST_CKPT_TPL = os.path.join(OUTPUT_DIR, "best_arch{arch_id}.pth")
+PRED_CSV_TPL = os.path.join(OUTPUT_DIR, "val_pred_arch{arch_id}.csv")
+
+
+# ============================================================
+# Hyperparameters
+# ============================================================
+LONGFORMER_NAME = "allenai/longformer-base-4096"
+NUM_CLASSES = 2
+PROJECTION_DIM = 512
+MAX_CODE_LENGTH = 512
+BATCH_SIZE = 2
+EPOCHS = 15
+LR = 2e-5
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.3
+PATIENCE = 4
+SEED = 42
+NUM_WORKERS = 0
+MOBA_BLOCK_SIZE = 64
+SLIDING_WINDOW_SIZE = 64
+
+
+# ============================================================
+# CLI Arguments
+# ============================================================
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--arch-id",
+    type=int,
+    required=True,
+    choices=list(range(12)),
+    help="Architecture variant id (0~11) for ablation"
+)
+parser.add_argument(
+    "--eval-only",
+    action="store_true",
+    help="Evaluate saved checkpoint without training"
+)
+parser.add_argument(
+    "--local-longformer",
+    default="",
+    help="Optional local Longformer model/tokenizer directory"
+)
+args = parser.parse_args()
+
+
+# ============================================================
+# Reproducibility & Device
+# ============================================================
+random.seed(SEED)
+np.random.se(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# Label Parser
+# ============================================================
+def resolve_label(image_name):
+    if "-0-" in image_name:
+        return 0
+    if "-1-" in image_name:
+        return 1
+    return None
+
+
+# ============================================================
+# Dataset (Unchanged)
+# ============================================================
+class UAFMultimodalDataset(Dataset):
+    def __init__(
+        self,
+        img_root,
+        meta_root,
+        code_root,
+        is_train,
+        tokenizer,
+        transform,
+        max_length=MAX_CODE_LENGTH
+    ):
+        self.img_paths = []
+        self.code_paths = []
+        self.labels = []
+        self.image_names = []
+        self.sample_ids = []
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.max_length = max_length
+
+        split_name = "train.txt" if is_train else "val.txt"
+        split_file = os.path.join(meta_root, split_name)
+        if not os.path.isfile(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+
+        missing_images = 0
+        missing_codes = 0
+        with open(split_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                image_name = line.split(",")[0].strip()
+                label = resolve_label(image_name)
+                if label is None:
+                    logger.warning(
+                        "Skipping unknown label pattern at %s:%d: %s",
+                        split_file, line_no, image_name
+                    )
+                    continue
+                image_path = os.path.join(img_root, "uaf", image_name)
+                code_name = image_name.replace("gen", "").replace(".jpg", ".c")
+                code_path = os.path.join(code_root, code_name)
+                if not os.path.isfile(image_path):
+                    missing_images += 1
+                    logger.warning("Image missing: %s", image_path)
+                    continue
+                if not os.path.isfile(code_path):
+                    missing_codes += 1
+                    logger.warning("Code missing: %s", code_path)
+                    continue
+                self.img_paths.append(image_path)
+                self.code_paths.append(code_path)
+                self.labels.append(label)
+                self.image_names.append(image_name)
+                self.sample_ids.append(len(self.sample_ids) + 1)
+
+        if not self.labels:
+            raise ValueError(
+                f"No valid image/code pairs found in {split_file}. "
+                "Check paths, naming convention."
+            )
+        uaf_count = sum(label == 0 for label in self.labels)
+        non_uaf_count = sum(label == 1 for label in self.labels)
+        logger.info(
+            "%s dataset: %d samples | UAF(label 0)=%d | Non-UAF(label 1)=%d | "
+            "missing images=%d | missing code files=%d",
+            "Train" if is_train else "Validation",
+            len(self), uaf_count, non_uaf_count, missing_images, missing_codes
+        )
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.img_paths[idx]).convert("RGB")
+        image_tensor = self.transform(image)
+        with open(self.code_paths[idx], "r", encoding="utf-8", errors="ignore") as f:
+            code_text = f.read()
+        encoded = self.tokenizer(
+            code_text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        return {
+            "image": image_tensor,
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+            "sample_id": self.sample_ids[idx],
+            "image_name": self.image_names[idx],
+        }
+
+
+# ============================================================
+# Image Preprocessing for ViT-B/16
+# ============================================================
+IMAGE_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+])
+
+
+# ============================================================
+# Attention Implementations
+# ============================================================
+class MoBABlockAttention(nn.Module):
+    def __init__(self, hidden_dim, block_size=MOBA_BLOCK_SIZE, dropout=0.1):
+        super().__init__()
+        self.block_size = block_size
+        self.hidden_dim = hidden_dim
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.scale = (hidden_dim ** -0.5)
+
+    def forward(self, x, attention_mask):
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        num_blocks = (L + self.block_size - 1) // self.block_size
+        q_blocks = q.reshape(B, num_blocks, self.block_size, C)
+        k_blocks = k.reshape(B, num_blocks, self.block_size, C)
+        v_blocks = v.reshape(B, num_blocks, self.block_size, C)
+        mask_blocks = attention_mask.reshape(B, num_blocks, self.block_size)
+
+        attn_scores = torch.einsum("b n s c, b n t c -> b n s t", q_blocks, k_blocks) * self.scale
+        mask_expand = mask_blocks.unsqueeze(-2) * mask_blocks.unsqueeze(-1)
+        attn_scores = attn_scores.masked_fill(mask_expand == 0, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.drop(attn_weights)
+
+        out_blocks = torch.einsum("b n s t, b n t c -> b n s c", attn_weights, v_blocks)
+        out = out_blocks.reshape(B, L, C)
+        out = self.out_proj(out)
+        out = self.drop(out)
+        return out
+
+
+class StaticSlidingAttention(nn.Module):
+    def __init__(self, hidden_dim, window_size=SLIDING_WINDOW_SIZE, dropout=0.1):
+        super().__init__()
+        self.window_size = window_size
+        self.hidden_dim = hidden_dim
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.scale = hidden_dim ** -0.5
+
+    def forward(self, x, attention_mask):
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        out = torch.zeros_like(x)
+        for i in range(L):
+            start = max(0, i - self.window_size // 2)
+            end = min(L, i + self.window_size // 2 + 1)
+            qi = q[:, i:i+1, :]
+            ki = k[:, start:end, :]
+            vi = v[:, start:end, :]
+            msk = attention_mask[:, start:end].unsqueeze(1)
+            score = (qi @ ki.transpose(-1,-2)) * self.scale
+            score = score.masked_fill(msk == 0, -1e9)
+            w = F.softmax(score, dim=-1)
+            w = self.drop(w)
+            out[:, i, :] = (w @ vi).squeeze(1)
+        out = self.out_proj(out)
+        out = self.drop(out)
+        return out
+
+
+# ============================================================
+# Auxiliary Union-Find Alias Module
+# ============================================================
+class UnionFindAliasHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.alias_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 2)
+        )
+
+    def forward(self, x):
+        return self.alias_mlp(x)
+
+
+# ============================================================
+# Composite Mixed Attention Stack Builder
+# ============================================================
+class MixedAttentionStack(nn.Module):
+    def __init__(self, hidden_size, layer_spec, dropout=0.1):
+        super().__init__()
+        attn_list = []
+        for t in layer_spec:
+            if t == "moba":
+                attn_list.append(MoBABlockAttention(hidden_size, MOBA_BLOCK_SIZE, dropout))
+            elif t == "sliding":
+                attn_list.append(StaticSlidingAttention(hidden_size, SLIDING_WINDOW_SIZE, dropout))
+            elif t == "longformer":
+                attn_list.append(None)
+            else:
+                raise ValueError("Unknown attention type")
+        self.attn_list = nn.ModuleList([a for a in attn_list if a is not None])
+        self.spec = layer_spec
+
+    def forward(self, hidden_states, base_hidden, attention_mask):
+        x = hidden_states
+        ptr = 0
+        for i, attn_type in enumerate(self.spec):
+            residual = base_hidden[i+1]
+            if attn_type == "longformer":
+                x = residual
+            else:
+                x = self.attn_list[ptr](x, attention_mask) + residual
+                ptr += 1
+        return x
+
+
+# ============================================================
+# Main Switchable Ablation Model
+# ============================================================
+class AblationMLGUAF(nn.Module):
+    def __init__(
+        self,
+        arch_id,
+        longformer_name=LONGFORMER_NAME,
+        projection_dim=PROJECTION_DIM,
+        dropout=DROPOUT,
+        pretrained_vit=True
+    ):
+        super().__init__()
+        self.arch_id = arch_id
+        self.use_visual = True
+        self.use_uf_alias = False
+        self.only_alias = False
+        self.graph_type = None
+
+        # attention layer specification for each ablation variant
+        if arch_id == 0:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.use_uf_alias = True
+        elif arch_id == 1:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.graph_type = "CFG"
+            self.use_uf_alias = True
+        elif arch_id == 2:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.graph_type = "PDG"
+            self.use_uf_alias = True
+        elif arch_id == 3:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.graph_type = "DFG"
+            self.use_uf_alias = True
+        elif arch_id == 4:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.use_visual = False
+            self.use_uf_alias = True
+        elif arch_id == 5:
+            spec = ["longformer"]*10
+        elif arch_id == 6:
+            spec = ["moba"]*10
+        elif arch_id == 7:
+            spec = ["longformer"]*6 + ["sliding"]*4
+        elif arch_id == 8:
+            spec = ["longformer"]*8 + ["moba"]*2
+        elif arch_id == 9:
+            spec = ["longformer"]*4 + ["moba"]*6
+        elif arch_id == 10:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.use_uf_alias = False
+        elif arch_id == 11:
+            spec = ["longformer"]*6 + ["moba"]*4
+            self.only_alias = True
+            self.use_uf_alias = True
+        else:
+            raise ValueError("invalid arch id")
+
+        # Visual branch
+        if self.use_visual:
+            weights = ViT_B_16_Weights.DEFAULT if pretrained_vit else None
+            self.vit = vit_b_16(weights=weights)
+            vit_dim = self.vit.heads.head.in_features
+            self.vit.heads = nn.Identity()
+            self.image_projection = nn.Sequential(
+                nn.Linear(vit_dim, projection_dim),
+                nn.LayerNorm(projection_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.vit = None
+            self.image_projection = None
+
+        # Code backbone
+        self.backbone = LongformerModel.from_pretrained(longformer_name)
+        self.hidden_size = self.backbone.config.hidden_size
+        self.mixed_attn_stack = MixedAttentionStack(self.hidden_size, spec, dropout=0.1)
+
+        self.code_projection = nn.Sequential(
+            nn.Linear(self.hidden_size, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Fusion & classifier
+        if self.only_alias:
+            self.alias_head = UnionFindAliasHead(self.hidden_size)
+            self.classifier = nn.Linear(self.hidden_size, NUM_CLASSES)
+        else:
+            fuse_in = projection_dim * 2 if self.use_visual else projection_dim
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(fuse_in, 512),
+                nn.LayerNorm(512),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(512, 256),
+                nn.LayerNorm(256),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(256, NUM_CLASSES),
+            )
+            if self.use_uf_alias:
+                self.alias_head = UnionFindAliasHead(projection_dim)
+            else:
+                self.alias_head = None
+
+    def forward(self, images, input_ids, attention_mask):
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        hs = outputs.hidden_states
+        code_seq = self.mixed_attn_stack(hs[0], hs, attention_mask)
+
+        # masked mean pooling
+        mask = attention_mask.unsqueeze(-1).to(code_seq.dtype)
+        code_pool = (code_seq * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        code_feat = self.code_projection(code_pool)
+
+        if self.only_alias:
+            alias_logits = self.alias_head(code_pool)
+            cls_logits = self.classifier(code_pool)
+            return cls_logits, alias_logits
+
+        feat_list = [code_feat]
+        if self.use_visual:
+            img_raw = self.vit(images)
+            img_feat = self.image_projection(img_raw)
+            feat_list.append(img_feat)
+        fused = torch.cat(feat_list, dim=1)
+        logits = self.fusion_mlp(fused)
+
+        if self.use_uf_alias and self.alias_head is not None:
+            alias_logits = self.alias_head(code_feat)
+            return logits, alias_logits
+        return logits
+
+
+# ============================================================
+# Epoch Runner, support alias auxiliary loss
+# ============================================================
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    desc=""
+):
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    y_true = []
+    y_pred = []
+    correct = 0
+    total_samples = 0
+    alias_criterion = nn.CrossEntropyLoss()
+    with torch.set_grad_enabled(training):
+        pbar = tqdm(loader, desc=desc, leave=False)
+        for batch in pbar:
+            images = batch["image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+            batch_size = labels.size(0)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+
+            out = model(images, input_ids, attention_mask)
+            if isinstance(out, tuple):
+                logits, alias_logits = out
+                # alias pseudo label aligned with UAF label for auxiliary task
+                alias_labels = labels.clone()
+                loss_cls = criterion(logits, labels)
+                loss_alias = alias_criterion(alias_logits, alias_labels)
+                loss = loss_cls + 0.2 * loss_alias
+            else:
+                logits = out
+                loss = criterion(logits, labels)
+
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            total_loss += loss.item()
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total_samples += batch_size
+            current_acc = correct / total_samples
+            y_pred.extend(preds.detach().cpu().tolist())
+            y_true.extend(labels.detach().cpu().tolist())
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{current_acc:.4f}"
+            })
+    metrics = {
+        "loss": total_loss / max(1, len(loader)),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+    }
+    return metrics
+
+
+# ============================================================
+# Prediction CSV Saver
+# ============================================================
+def save_predictions(model, loader, csv_path):
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Predict", leave=False):
+            images = batch["image"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            out = model(images, input_ids, attention_mask)
+            if isinstance(out, tuple):
+                logits, _ = out
+            else:
+                logits = out
+            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            predictions = probabilities.argmax(axis=1)
+            for i, prediction in enumerate(predictions):
+                true_label = int(batch["label"][i])
+                rows.append({
+                    "sample_id": int(batch["sample_id"][i]),
+                    "image_name": batch["image_name"][i],
+                    "ground_truth": true_label,
+                    "ground_truth_name": "UAF" if true_label == 0 else "Non-UAF",
+                    "prediction": int(prediction),
+                    "prediction_name": "UAF" if prediction == 0 else "Non-UAF",
+                    "prob_uaf": float(probabilities[i, 0]),
+                    "prob_non_uaf": float(probabilities[i, 1]),
+                })
+    pd.DataFrame(rows).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    logger.info("Predictions saved to %s", csv_path)
+
+
+# ============================================================
+# Main Pipeline
+# ============================================================
+def main():
+    arch_id = args.arch_id
+    longformer_name = args.local_longformer.strip() or LONGFORMER_NAME
+    ckpt_path = BEST_CKPT_TPL.format(arch_id=arch_id)
+    pred_csv_path = PRED_CSV_TPL.format(arch_id=arch_id)
+
+    arch_desc_map = {
+        0: "Full MLG-UAF (6 Longformer + 4 MoBA)",
+        1: "Replace MLG with CFG",
+        2: "Replace MLG with PDG",
+        3: "Replace MLG with DFG",
+        4: "without the full MLG CLIP visual branch",
+        5: "Pure Longformer (10 layers, static sliding)",
+        6: "Pure MoBA (10 layers)",
+        7: "6 Longformer + 4 Static Sliding Attention",
+        8: "8 Longformer + 2 MoBA",
+        9: "4 Longformer + 6 MoBA",
+        10: "without Auxiliary Union-Find Alias",
+        11: "Only Auxiliary Alias Module",
+    }
+    logger.info("Selected Arch ID %d: %s", arch_id, arch_desc_map[arch_id])
+    logger.info("Device: %s", DEVICE)
+    logger.info("Label convention: 0=UAF, 1=Non-UAF")
+
+    tokenizer = AutoTokenizer.from_pretrained(longformer_name)
+    train_dataset = UAFMultimodalDataset(
+        IMG_ROOT, META_ROOT, CODE_ROOT, True, tokenizer, IMAGE_TRANSFORM
+    )
+    val_dataset = UAFMultimodalDataset(
+        IMG_ROOT, META_ROOT, CODE_ROOT, False, tokenizer, IMAGE_TRANSFORM
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available()
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available()
+    )
+    model = AblationMLGUAF(arch_id=arch_id, longformer_name=longformer_name).to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    if args.eval_only:
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state"])
+    else:
+        best_f1 = -1.0
+        stale_epochs = 0
+        for epoch in range(EPOCHS):
+            train_metrics = run_epoch(
+                model, train_loader, criterion, optimizer, desc=f"Train {epoch + 1}/{EPOCHS}"
+            )
+            val_metrics = run_epoch(
+                model, val_loader, criterion, None, desc=f"Val {epoch + 1}/{EPOCHS}"
+            )
+            logger.info(
+                "Epoch %02d/%02d | train loss=%.4f acc=%.4f F1=%.4f | "
+                "val loss=%.4f acc=%.4f precision=%.4f recall=%.4f F1=%.4f",
+                epoch + 1, EPOCHS,
+                train_metrics["loss"], train_metrics["accuracy"], train_metrics["f1"],
+                val_metrics["loss"], val_metrics["accuracy"],
+                val_metrics["precision"], val_metrics["recall"], val_metrics["f1"]
+            )
+            if val_metrics["f1"] > best_f1:
+                best_f1 = val_metrics["f1"]
+                stale_epochs = 0
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "epoch": epoch + 1,
+                    "best_val_f1": best_f1,
+                    "arch_id": arch_id,
+                }, ckpt_path)
+                logger.info("Saved best checkpoint: %s", ckpt_path)
+            else:
+                stale_epochs += 1
+                if stale_epochs >= PATIENCE:
+                    logger.info("Early stopping after %d stale epochs", PATIENCE)
+                    break
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state"])
+        logger.info("Best epoch=%s, best validation F1=%.4f",
+                    checkpoint.get("epoch"), checkpoint.get("best_val_f1", float("nan")))
+
+    val_metrics = run_epoch(model, val_loader, criterion, None, desc="Final validation")
+    logger.info("Final validation metrics: %s", val_metrics)
+    save_predictions(model, val_loader, pred_csv_path)
+
+
+if __name__ == "__main__":
+    main()
