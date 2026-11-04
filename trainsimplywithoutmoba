@@ -84,19 +84,11 @@ class UAFDataset(Dataset):
         label = self.labels[idx]
         return img_tensor, input_ids, attention_mask, label
 
-class LabelEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.proj = nn.Linear(1, 512)
-
-    def forward(self, labels):
-        return self.proj(labels.float().unsqueeze(-1))
-
+# ========== 删除 LabelEncoder ==========
 class SimpleVLM(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
         self.clip_model = clip_model
-        self.label_encoder = LabelEncoder()
 
         for param in self.clip_model.parameters():
             param.requires_grad = False
@@ -110,14 +102,15 @@ class SimpleVLM(nn.Module):
         self.emb_dim = emb_dim
         logger.info("Detected CLIP embedding dim = {}".format(emb_dim))
 
+        # 融合维度：img + text 两路，emb_dim *2
         self.classifier = nn.Sequential(
-            nn.Linear(emb_dim*3, 512),
+            nn.Linear(emb_dim * 2, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(512,2)
         )
 
-    def forward(self, pixel_values, input_ids, attention_mask, labels):
+    def forward(self, pixel_values, input_ids, attention_mask):
         out = self.clip_model(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -125,9 +118,8 @@ class SimpleVLM(nn.Module):
         )
         img_feat = out.image_embeds
         txt_feat = out.text_embeds
-        fy_feat = self.label_encoder(labels)
 
-        fuse = torch.cat([fy_feat, img_feat, txt_feat], dim=1)
+        fuse = torch.cat([img_feat, txt_feat], dim=1)
         logits = self.classifier(fuse)
         return logits
 
@@ -142,7 +134,8 @@ def evaluate(model, dataloader, criterion, device):
             input_ids = input_ids.to(device)
             masks = masks.to(device)
             labels = labels.to(device)
-            logits = model(images, input_ids, masks, labels)
+            # forward 不再传labels
+            logits = model(images, input_ids, masks)
             loss = criterion(logits, labels)
             total_loss += loss.item()
             preds = torch.argmax(logits, dim=1)
@@ -172,7 +165,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, e
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(images, input_ids, masks, labels)
+            logits = model(images, input_ids, masks)
             loss = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -240,4 +233,4 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-5)
 
-    train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs=10, save_dir=save_dir, patience=3)这个程序是训练两个inputs的mlp耦合codebert vit吗
+    train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs=10, save_dir=save_dir, patience=3)
