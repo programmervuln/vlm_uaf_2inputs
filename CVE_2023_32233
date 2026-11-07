@@ -1,0 +1,309 @@
+import re
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+C_CODE = r"""
+struct nft_set {
+    const struct nft_set_ops *ops;
+    char *name;
+    bool anonymous;
+};
+
+static void nft_set_destroy(struct nft_set *set)
+{
+    kvfree(set);
+}
+
+static void process_delete_rule(struct nft_set *set)
+{
+    if (set->anonymous)
+        nft_set_destroy(set);
+}
+
+static inline struct nft_set_ext *
+nft_set_elem_ext(const struct nft_set *set, void *elem)
+{
+    return (struct nft_set_ext *)
+        ((char *)elem + set->ops->elemsize);
+}
+
+static void process_delete_set_element(
+    struct nft_set *set, void *elem)
+{
+    nft_set_elem_ext(set, elem);
+}
+
+static void process_batch(struct nft_set *set, void *elem)
+{
+    process_delete_rule(set);
+    process_delete_set_element(set, elem);
+}
+"""
+
+VAR_ID_MAP = {"set": 1}
+ALLOC_FUNCTIONS = {"malloc", "calloc", "realloc", "kmalloc", "kzalloc", "kvmalloc"}
+FREE_FUNCTIONS = {"free", "kfree", "kvfree", "vfree"}
+MAX_CALL_DEPTH = 20
+
+
+def filter_comments(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+
+def identify_functions(code):
+    pattern = re.compile(
+        r"""
+        ^\s*
+        (?:static\s+)?
+        (?:inline\s+)?
+        (?:[\w]+\s+)*?
+        [\w*]+\s+
+        ([A-Za-z_]\w*)
+        \s*
+        \([^;{}]*\)
+        \s*
+        \{
+        """,
+        re.MULTILINE | re.VERBOSE
+    )
+    functions = {}
+    for match in pattern.finditer(code):
+        name = match.group(1)
+        open_brace = code.find("{", match.start())
+        pos, depth = open_brace + 1, 1
+        while pos < len(code) and depth:
+            if code[pos] == "{":
+                depth += 1
+            elif code[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            functions[name] = code[open_brace + 1:pos - 1]
+    return functions, set(functions)
+
+
+def find_function_call(line, function_names):
+    for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", line):
+        if match.group(1) in function_names:
+            return match.group(1)
+    return None
+
+
+def build_interprocedural_sequence(func_body_map, entry_func, visited=None, depth=0):
+    if visited is None:
+        visited = []
+    if entry_func not in func_body_map:
+        raise KeyError(f"Function not found: {entry_func}")
+    if entry_func in visited or depth >= MAX_CALL_DEPTH:
+        return []
+
+    visited = visited + [entry_func]
+    sequence = []
+
+    for raw_line in func_body_map[entry_func].splitlines():
+        line = raw_line.strip()
+        if not line or line in {"{", "}"}:
+            continue
+
+        callee = find_function_call(line, set(func_body_map))
+        if callee:
+            sequence.extend(
+                build_interprocedural_sequence(
+                    func_body_map, callee, visited, depth + 1
+                )
+            )
+        else:
+            sequence.append((entry_func, line))
+
+    return sequence
+
+
+def extract_malloc(line):
+    events = []
+    for func in ALLOC_FUNCTIONS:
+        pattern = (
+            r"\b([A-Za-z_]\w*)\s*=\s*"
+            r"(?:\([^)]*\)\s*)?" + re.escape(func) + r"\s*\("
+        )
+        match = re.search(pattern, line)
+        if match and match.group(1) in VAR_ID_MAP:
+            events.append(("malloc", match.group(1)))
+    return events
+
+
+def extract_free(line):
+    pattern = (
+        r"\b(" + "|".join(FREE_FUNCTIONS) +
+        r")\s*\(\s*([A-Za-z_]\w*)\s*\)"
+    )
+    match = re.search(pattern, line)
+    if match and match.group(2) in VAR_ID_MAP:
+        return ("free", match.group(2))
+    return None
+
+
+def extract_use_vars(line):
+    events = []
+    line_clean = re.sub(
+        r"\b(?:free|kfree|kvfree|vfree)\s*\([^)]*\)", "", line
+    )
+    for var in VAR_ID_MAP:
+        if re.search(r"\b" + re.escape(var) + r"\b", line_clean):
+            events.append(("use", var))
+    return events
+
+
+def extract_memory_sequence(trace):
+    memory_sequence = []
+    for function_name, line in trace:
+        memory_sequence.extend(extract_malloc(line))
+        free_event = extract_free(line)
+        if free_event:
+            memory_sequence.append(free_event)
+        memory_sequence.extend(extract_use_vars(line))
+    return memory_sequence
+
+
+def is_target_pattern(memory_sequence):
+    freed_variables = set()
+    for index, (action, variable) in enumerate(memory_sequence):
+        if action == "free":
+            freed_variables.add(variable)
+        elif action == "use" and variable in freed_variables:
+            return True, index, variable
+    return False, None, None
+
+
+# Drawing-only adjustment: slimmer nodes and tighter overall layout.
+# All static-analysis functions above remain unchanged.
+def draw_uaf_flow(feature_list):
+    fig, ax = plt.subplots(figsize=(10.5, 2.5))
+
+    # Narrower and smaller geometry than the previous version.
+    node_width = 0.42
+    node_height = 0.48
+    triangle_base = 0.46
+    triangle_height = 0.52
+    circle_radius = 0.22
+    spacing = 1.12
+
+    valid_features = [
+        (action, var)
+        for action, var in feature_list
+        if var in VAR_ID_MAP and action in {"malloc", "free", "use"}
+    ]
+
+    for i, (action, var) in enumerate(valid_features):
+        x = i * spacing
+        var_id = VAR_ID_MAP[var]
+
+        if action == "malloc":
+            patch = plt.Circle(
+                (x, 0), circle_radius,
+                fc="lightcoral", ec="black", linewidth=1.0
+            )
+        elif action == "free":
+            patch = plt.Polygon(
+                [
+                    (x - triangle_base / 2, -triangle_height / 2),
+                    (x + triangle_base / 2, -triangle_height / 2),
+                    (x, triangle_height / 2)
+                ],
+                fc="lightgreen", ec="black", linewidth=1.0
+            )
+        else:
+            patch = plt.Rectangle(
+                (x - node_width / 2, -node_height / 2),
+                node_width, node_height,
+                fc="lightblue", ec="black", linewidth=1.0
+            )
+
+        ax.add_patch(patch)
+        ax.text(
+            x, 0, str(var_id),
+            ha="center", va="center", fontsize=9
+        )
+
+    count = len(valid_features)
+    xmax = (count - 1) * spacing if count else 0
+
+    ax.set_xlim(-0.42, xmax + 0.42)
+    ax.set_ylim(-0.42, 0.42)
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    ax.set_title(
+        "CVE-2023-32233 UAF Execution Flow",
+        fontsize=11, pad=7
+    )
+
+    fig.tight_layout(pad=0.35)
+
+    output_path = Path(__file__).with_name(
+        "CVE_2023_32233_UAF_extra_slim.png"
+    )
+    fig.savefig(
+        output_path, dpi=600,
+        bbox_inches="tight", pad_inches=0.08
+    )
+    print(f"Figure saved: {output_path}")
+    plt.show()
+
+
+def main():
+    print("=" * 60)
+    print("Linux CVE-2023-32233 UAF Analysis")
+    print("Abstracted Interprocedural Transaction Model")
+    print("=" * 60)
+
+    clean_code = filter_comments(C_CODE)
+    func_body_map, function_names = identify_functions(clean_code)
+
+    print("\n========== Identified Functions ==========")
+    for name in func_body_map:
+        print(name)
+
+    entry_function = "process_batch"
+    if entry_function not in func_body_map:
+        raise RuntimeError(f"Entry function not found: {entry_function}")
+
+    trace = build_interprocedural_sequence(
+        func_body_map, entry_function
+    )
+
+    print("\n========== Expanded Transaction Trace ==========")
+    for index, (function_name, line) in enumerate(trace):
+        print(f"{index + 1:02d}. [{function_name}] {line}")
+
+    memory_sequence = extract_memory_sequence(trace)
+
+    print("\n========== Memory Operation Sequence ==========")
+    for index, (action, variable) in enumerate(memory_sequence):
+        print(
+            f"{index + 1:02d}. {action.upper()} {variable} "
+            f"(Var-ID: {VAR_ID_MAP[variable]})"
+        )
+
+    detected, use_index, variable = is_target_pattern(memory_sequence)
+
+    print("\n========== Detection Result ==========")
+    if detected:
+        print("[+] Potential UAF pattern detected")
+        print(f"[+] Pointer: {variable}")
+        print("[+] Memory lifecycle: FREE -> USE")
+        print(f"[+] Use event index: {use_index + 1}")
+        print(
+            "[+] Transaction context: "
+            "NFT_MSG_DELRULE -> NFT_MSG_DELSETELEM"
+        )
+        draw_uaf_flow(memory_sequence)
+    else:
+        print("[-] No UAF pattern detected")
+
+    print("\nNote: This analyzes the supplied abstract pseudocode,")
+    print("not the complete original kernel implementation.")
+
+
+if __name__ == "__main__":
+    main()
