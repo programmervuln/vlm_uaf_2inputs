@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""
+C/C++ MLG feature extractor.
+
+Primary features:
+  - malloc: heap allocation (circle)
+  - use: pointer-based memory access (rectangle)
+  - free: heap deallocation (triangle)
+  - alias: pointer alias relation (trapezoid; auxiliary feature)
+
+The extractor first builds a call-site-ordered, recursively expanded statement
+sequence from the selected entry function (main by default). Memory operations
+are then extracted from that sequence, so malloc/use/free are the main events
+and alias is an additional event.
+
+This is a regex-based prototype, not a compiler-grade static analyzer. It does
+not prove path feasibility or fully resolve C/C++ syntax, macros, fields,
+function pointers, or complex pointer analysis.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Optional
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Polygon, Rectangle, Patch
+
+
+# ------------------------------ Data records ------------------------------
+
+@dataclass
+class Function:
+    name: str
+    params: list[str]
+    param_names: list[str]
+    body: str
+    body_start: int
+
+
+@dataclass
+class Operation:
+    step: int
+    kind: str                 # malloc / use / free / alias
+    variable: str
+    var_id: int
+    line: int
+    function: str
+    statement: str
+    source: str = ""
+    source_id: int = 0
+    detail: str = ""
+
+
+# ------------------------------ C preprocessing ---------------------------
+
+def remove_comments(code: str) -> str:
+    """Remove comments while preserving newlines and quoted strings."""
+    token = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*', re.S)
+
+    def replace(m: re.Match) -> str:
+        text = m.group(0)
+        if text.startswith(('"', "'")):
+            return text
+        return "\n" * text.count("\n")
+
+    return token.sub(replace, code)
+
+
+def matching_brace(code: str, opening: int) -> Optional[int]:
+    depth = 0
+    quote = None
+    escaped = False
+    for pos in range(opening, len(code)):
+        ch = code[pos]
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return pos
+    return None
+
+
+def split_args(text: str) -> list[str]:
+    args, start, depth, quote, escaped = [], 0, 0, None, False
+    for i, ch in enumerate(text):
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            args.append(text[start:i].strip())
+            start = i + 1
+    tail = text[start:].strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def get_param_name(param: str) -> str:
+    p = re.sub(r'\[[^\]]*\]', '', param.split('=')[0]).strip()
+    names = re.findall(r'[A-Za-z_]\w*', p)
+    if not names or names[-1] in {
+        "const", "volatile", "struct", "class", "unsigned", "signed", "void"
+    }:
+        return ""
+    return names[-1]
+
+
+FUNC_PATTERN = re.compile(
+    r'(?m)^[ \t]*(?:(?:static|inline|extern|const|unsigned|signed|long|short|'
+    r'void|char|int|float|double|struct\s+\w+|[A-Za-z_]\w*)'
+    r'(?:[ \t\*]+))+([A-Za-z_]\w*)[ \t]*\(([^;{}]*)\)[ \t]*\{'
+)
+
+
+def identify_functions(code: str) -> dict[str, Function]:
+    functions: dict[str, Function] = {}
+    for m in FUNC_PATTERN.finditer(code):
+        name, param_text = m.group(1), m.group(2)
+        open_brace = m.end() - 1
+        close_brace = matching_brace(code, open_brace)
+        if close_brace is None:
+            continue
+        params = split_args(param_text)
+        if len(params) == 1 and params[0] == "void":
+            params = []
+        functions[name] = Function(
+            name=name,
+            params=params,
+            param_names=[get_param_name(p) for p in params],
+            body=code[open_brace + 1:close_brace],
+            body_start=open_brace + 1,
+        )
+    return functions
+
+
+def split_statements(body: str, absolute_start: int, full_code: str) -> list[tuple[int, str]]:
+    """Split at ; and braces outside parentheses/strings; retain source line numbers."""
+    result = []
+    start = 0
+    paren = bracket = 0
+    quote = None
+    escaped = False
+    for i, ch in enumerate(body):
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren = max(0, paren - 1)
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket = max(0, bracket - 1)
+        elif ch in ";{}" and paren == 0 and bracket == 0:
+            chunk = body[start:i + 1].strip()
+            if chunk:
+                line = full_code.count("\n", 0, absolute_start + start) + 1
+                result.append((line, chunk))
+            start = i + 1
+    tail = body[start:].strip()
+    if tail:
+        line = full_code.count("\n", 0, absolute_start + start) + 1
+        result.append((line, tail))
+    return result
+
+
+# --------------------------- Execution sequence ----------------------------
+
+def find_calls(statement: str, function_names: set[str]) -> list[tuple[str, list[str]]]:
+    calls = []
+    # Match known user-defined functions only; allocator/API calls are not expanded.
+    for name in sorted(function_names, key=len, reverse=True):
+        for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', statement):
+            open_pos = statement.find("(", m.start())
+            depth, quote, escaped = 1, None, False
+            pos = open_pos + 1
+            while pos < len(statement) and depth:
+                ch = statement[pos]
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == quote:
+                        quote = None
+                elif ch in ("'", '"'):
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                pos += 1
+            if depth == 0:
+                calls.append((name, split_args(statement[open_pos + 1:pos - 1])))
+    # Preserve left-to-right call-site order and avoid duplicate matches.
+    unique = {}
+    for item in calls:
+        unique[(item[0], tuple(item[1]))] = item
+    return sorted(unique.values(), key=lambda x: statement.find(x[0] + "("))
+
+
+def expand_execution_sequence(
+    code: str, functions: dict[str, Function], entry: str, max_depth: int = 12
+) -> list[dict]:
+    sequence: list[dict] = []
+    function_names = set(functions)
+
+    def visit(name: str, stack: list[str], callsite: str = "") -> None:
+        if name not in functions:
+            return
+        if len(stack) >= max_depth or name in stack:
+            sequence.append({
+                "function": name, "line": 0,
+                "statement": f"[recursive/depth-limited call: {name}]",
+                "kind": "call_limit", "callsite": callsite
+            })
+            return
+        fn = functions[name]
+        for line, stmt in split_statements(fn.body, fn.body_start, code):
+            s = stmt.strip()
+            if not s or s in ("{", "}"):
+                continue
+            sequence.append({
+                "function": name, "line": line, "statement": s,
+                "kind": "statement", "callsite": callsite
+            })
+            # Expand user-defined calls immediately after the call statement.
+            for callee, args in find_calls(s, function_names):
+                callee_fn = functions[callee]
+                # Parameter-to-argument alias is auxiliary and precedes callee events.
+                for index, param_name in enumerate(callee_fn.param_names):
+                    if not param_name or index >= len(args):
+                        continue
+                    arg_match = re.match(r'\s*(?:&\s*)?([A-Za-z_]\w*)\s*$', args[index])
+                    if arg_match:
+                        sequence.append({
+                            "function": name, "line": line,
+                            "statement": f"__PARAM_BIND__ {param_name} <- {arg_match.group(1)}",
+                            "kind": "param_bind",
+                            "callsite": f"{name}:L{line} -> {callee}"
+                        })
+                visit(callee, stack + [name], callsite=f"{name}:L{line} -> {callee}")
+
+    if entry not in functions:
+        raise ValueError(f"Entry function '{entry}' not found. Available: {', '.join(functions)}")
+    visit(entry, [])
+    return sequence
+
+
+# ----------------------- Memory-operation extraction -----------------------
+
+ALLOC_RE = re.compile(
+    r'(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?:(?:\([^;()]*\*\s*\)\s*)?)'
+    r'(?P<fn>malloc|calloc|realloc|aligned_alloc|strdup|strndup)\s*\('
+)
+NEW_RE = re.compile(r'(?P<lhs>[A-Za-z_]\w*)\s*=\s*new\b')
+FREE_RE = re.compile(r'\bfree\s*\(\s*(?:\([^)]*\)\s*)?(?P<var>[A-Za-z_]\w*)\s*\)')
+DELETE_RE = re.compile(r'\bdelete\s*(?:\[\s*\])?\s*(?P<var>[A-Za-z_]\w*)')
+DECL_RE = re.compile(
+    r'\b(?:const\s+|volatile\s+|struct\s+\w+\s+|class\s+\w+\s+)?'
+    r'[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)?\s*\*+\s*(?P<var>[A-Za-z_]\w*)'
+)
+ALIAS_RE = re.compile(
+    r'(?<![=!<>])(?P<lhs>[A-Za-z_]\w*)\s*=\s*'
+    r'(?P<rhs>&\s*[A-Za-z_]\w*|\(\s*(?:const\s+)?[A-Za-z_]\w*\s*\*+\s*\)\s*[A-Za-z_]\w*|[A-Za-z_]\w*)\s*;'
+)
+ACCESS_PATTERNS = [
+    re.compile(r'(?<![&])\*\s*(?P<var>[A-Za-z_]\w*)'),       # *p
+    re.compile(r'\b(?P<var>[A-Za-z_]\w*)\s*->\s*[A-Za-z_]\w*'),  # p->field
+    re.compile(r'\b(?P<var>[A-Za-z_]\w*)\s*\[[^\]]+\]'),     # p[i]
+]
+MEMORY_APIS = {"memcpy", "memmove", "memset", "memcmp", "strlen",
+               "strcpy", "strncpy", "strcmp", "strcat", "fread", "fwrite"}
+KEYWORDS = {
+    "if", "else", "for", "while", "switch", "case", "return", "sizeof",
+    "int", "char", "void", "long", "short", "float", "double", "const",
+    "volatile", "struct", "class", "unsigned", "signed", "NULL", "nullptr",
+    "malloc", "calloc", "realloc", "free", "new", "delete"
+}
+
+
+class FeatureExtractor:
+    def __init__(self):
+        self.var_ids: dict[str, int] = {}
+        self.operations: list[Operation] = []
+
+    def var_id(self, name: str) -> int:
+        if name not in self.var_ids:
+            self.var_ids[name] = len(self.var_ids) + 1
+        return self.var_ids[name]
+
+    def add(self, kind: str, fn: str, var: str, line: int, stmt: str,
+            source: str = "", detail: str = "") -> None:
+        key = f"{fn}::{var}"
+        source_key = f"{fn}::{source}" if source else ""
+        self.operations.append(Operation(
+            step=len(self.operations) + 1, kind=kind, variable=key,
+            var_id=self.var_id(key), line=line, function=fn, statement=stmt,
+            source=source_key, source_id=self.var_id(source_key) if source_key else 0,
+            detail=detail
+        ))
+
+    def extract(self, sequence: list[dict]) -> list[Operation]:
+        # First pass: discover pointer declarations and parameters from executed sequence.
+        pointer_vars: set[str] = set()
+        for item in sequence:
+            fn, stmt = item["function"], item["statement"]
+            for m in DECL_RE.finditer(stmt):
+                pointer_vars.add(f"{fn}::{m.group('var')}")
+
+        # A parameter becomes a pointer if it is used in a pointer context.
+        for item in sequence:
+            fn, stmt = item["function"], item["statement"]
+            for m in FREE_RE.finditer(stmt):
+                pointer_vars.add(f"{fn}::{m.group('var')}")
+            for m in DELETE_RE.finditer(stmt):
+                pointer_vars.add(f"{fn}::{m.group('var')}")
+            for m in ALLOC_RE.finditer(stmt):
+                pointer_vars.add(f"{fn}::{m.group('lhs')}")
+            for m in NEW_RE.finditer(stmt):
+                pointer_vars.add(f"{fn}::{m.group('lhs')}")
+
+        # Second pass: extract operations in the expanded sequence order.
+        for item in sequence:
+            fn, line, stmt = item["function"], item["line"], item["statement"]
+            if item.get("kind") == "param_bind":
+                binding = re.match(r'__PARAM_BIND__\s+([A-Za-z_]\w*)\s*<-\s*([A-Za-z_]\w*)', stmt)
+                if binding:
+                    param_name, arg_name = binding.groups()
+                    caller_name = item["callsite"].split(":L")[0]
+                    callee_name = item["callsite"].split(" -> ")[-1]
+                    caller_key = f"{caller_name}::{arg_name}"
+                    callee_key = f"{callee_name}::{param_name}"
+                    self.operations.append(Operation(
+                        step=len(self.operations) + 1, kind="alias",
+                        variable=callee_key, var_id=self.var_id(callee_key),
+                        line=line, function=fn, statement=stmt,
+                        source=arg_name, source_id=self.var_id(caller_key),
+                        detail="interprocedural_parameter"
+                    ))
+                continue
+            if line == 0:
+                continue
+
+            # Allocation is a primary MLG operation.
+            alloc = ALLOC_RE.search(stmt) or NEW_RE.search(stmt)
+            if alloc:
+                self.add("malloc", fn, alloc.group("lhs"), line, stmt,
+                         detail=alloc.groupdict().get("fn", "new"))
+                pointer_vars.add(f"{fn}::{alloc.group('lhs')}")
+
+            # Deallocation is a primary MLG operation.
+            freed = FREE_RE.search(stmt) or DELETE_RE.search(stmt)
+            if freed:
+                self.add("free", fn, freed.group("var"), line, stmt,
+                         detail="free" if FREE_RE.search(stmt) else "delete")
+                pointer_vars.add(f"{fn}::{freed.group('var')}")
+
+            # Alias is auxiliary: record it, but do not replace malloc/use/free.
+            alias = ALIAS_RE.search(stmt)
+            if alias:
+                lhs, rhs_expr = alias.group("lhs"), alias.group("rhs").strip()
+                rhs = re.search(r'([A-Za-z_]\w*)\s*$', rhs_expr)
+                rhs_name = rhs.group(1) if rhs else ""
+                lhs_key = f"{fn}::{lhs}"
+                rhs_key = f"{fn}::{rhs_name}" if rhs_name else ""
+                is_address = rhs_expr.startswith("&")
+                is_cast = rhs_expr.startswith("(")
+                if rhs_name and lhs != rhs_name and (
+                    lhs_key in pointer_vars or rhs_key in pointer_vars or is_address or is_cast
+                ):
+                    pointer_vars.add(lhs_key)
+                    if not is_address:
+                        pointer_vars.add(rhs_key)
+                    self.add("alias", fn, lhs, line, stmt, source=rhs_name,
+                             detail="address_alias" if is_address else
+                                    ("cast_alias" if is_cast else "pointer_alias"))
+
+            # Pointer dereference/member/array accesses are use operations.
+            used: set[str] = set()
+            for pattern in ACCESS_PATTERNS:
+                for m in pattern.finditer(stmt):
+                    name = m.group("var")
+                    if f"{fn}::{name}" in pointer_vars:
+                        used.add(name)
+
+            # Common library routines read/write through pointer arguments.
+            for api in MEMORY_APIS:
+                for m in re.finditer(r'\b' + api + r'\s*\((.*?)\)', stmt):
+                    for arg in split_args(m.group(1)):
+                        candidate = re.match(r'\s*(?:&\s*)?([A-Za-z_]\w*)', arg)
+                        if candidate and f"{fn}::{candidate.group(1)}" in pointer_vars:
+                            used.add(candidate.group(1))
+
+            # A function call receiving a pointer is a use of that pointer at call site.
+            # This is separate from the interprocedural parameter binding/alias feature.
+            for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\((.*?)\)', stmt):
+                call_name = m.group(1)
+                if call_name in {"free", "malloc", "calloc", "realloc", "aligned_alloc",
+                                 "strdup", "strndup", "memcpy", "memmove", "memset"}:
+                    continue
+                for arg in split_args(m.group(2)):
+                    candidate = re.match(r'\s*(?:&\s*)?([A-Za-z_]\w*)\s*$', arg)
+                    if candidate and f"{fn}::{candidate.group(1)}" in pointer_vars:
+                        used.add(candidate.group(1))
+
+            for name in sorted(used):
+                # Avoid duplicate "use" on a declaration/alias-only assignment.
+                if DECL_RE.search(stmt) or (alias and alias.group("lhs") == name):
+                    continue
+                self.add("use", fn, name, line, stmt)
+
+        return self.operations
+
+
+# --------------------------------- Drawing ----------------------------------
+
+def draw_graph(operations: list[Operation], output: Path, dpi: int = 300) -> None:
+    """Draw the original MLG visual grammar: malloc circle, use rectangle,
+    free triangle, alias trapezoid. Alias remains one auxiliary operation type.
+    """
+    if not operations:
+        print("No malloc/use/free/alias operations found; graph not generated.")
+        return
+
+    # Wrap long sequences into rows to keep every operation visible.
+    per_row = 8
+    rows = (len(operations) + per_row - 1) // per_row
+    fig, ax = plt.subplots(figsize=(max(12, per_row * 2.25), max(4.5, rows * 3.0)))
+    ax.set_xlim(-1.2, per_row * 2.25 - 0.2)
+    ax.set_ylim(-0.9, rows * 3.0 - 0.2)
+    ax.axis("off")
+
+    for i, op in enumerate(operations):
+        row, col = divmod(i, per_row)
+        x = col * 2.25
+        y = (rows - 1 - row) * 3.0 + 1.35
+
+        if op.kind == "malloc":
+            ax.add_patch(Circle((x, y), 0.52, facecolor="lightcoral",
+                                edgecolor="black", linewidth=1.5))
+            label = f"malloc\\nVar-ID {op.var_id}"
+        elif op.kind == "use":
+            ax.add_patch(Rectangle((x - 0.62, y - 0.42), 1.24, 0.84,
+                                   facecolor="lightblue", edgecolor="black", linewidth=1.5))
+            label = f"use\\nVar-ID {op.var_id}"
+        elif op.kind == "free":
+            ax.add_patch(Polygon([(x - 0.62, y - 0.42), (x + 0.62, y - 0.42),
+                                  (x, y + 0.52)], closed=True,
+                                 facecolor="lightgreen", edgecolor="black", linewidth=1.5))
+            label = f"free\\nVar-ID {op.var_id}"
+        else:
+            ax.add_patch(Polygon([(x - 0.68, y + 0.38), (x + 0.68, y + 0.38),
+                                  (x + 0.82, y - 0.38), (x - 0.82, y - 0.38)],
+                                 closed=True, facecolor="ivory",
+                                 edgecolor="black", linewidth=1.5))
+            label = f"alias\\n{op.source_id} → {op.var_id}"
+
+        ax.text(x, y, label, ha="center", va="center", fontsize=8, weight="bold")
+        ax.text(x, y - 0.88, f"Step {op.step} | {op.function}:L{op.line}",
+                ha="center", va="center", fontsize=7)
+        ax.text(x, y - 1.12, op.variable.split("::")[-1],
+                ha="center", va="center", fontsize=7)
+
+    legend = [
+        Patch(facecolor="lightcoral", edgecolor="black", label="Allocation (malloc)"),
+        Patch(facecolor="lightblue", edgecolor="black", label="Memory access (use)"),
+        Patch(facecolor="lightgreen", edgecolor="black", label="Deallocation (free)"),
+        Patch(facecolor="ivory", edgecolor="black", label="Pointer alias (auxiliary)"),
+    ]
+    ax.legend(handles=legend, loc="upper center", bbox_to_anchor=(0.5, 1.02),
+              ncol=4, frameon=False, fontsize=9)
+    ax.set_title("Ordered MLG Memory Operations", fontsize=14, weight="bold", pad=28)
+    fig.tight_layout()
+    fig.savefig(output, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"MLG diagram saved: {output} ({dpi} DPI)")
+
+
+# ----------------------------------- CLI ------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Extract execution sequence and MLG malloc/use/free features; alias is auxiliary."
+    )
+    parser.add_argument("source", type=Path, help="C/C++ source file")
+    parser.add_argument("--entry", default="main", help="Entry function (default: main)")
+    parser.add_argument("--out", type=Path, default=Path("mlg_output"))
+    parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--max-depth", type=int, default=12)
+    args = parser.parse_args()
+
+    raw = args.source.read_text(encoding="utf-8", errors="replace")
+    code = remove_comments(raw)
+    functions = identify_functions(code)
+    if not functions:
+        raise SystemExit("No function definitions recognized.")
+
+    print("Identified functions:")
+    for fn in functions.values():
+        print(f"  {fn.name}({', '.join(fn.params)})")
+
+    sequence = expand_execution_sequence(code, functions, args.entry, args.max_depth)
+    extractor = FeatureExtractor()
+    operations = extractor.extract(sequence)
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    seq_file = args.out / "execution_sequence.json"
+    ops_file = args.out / "mlg_operations.json"
+    ids_file = args.out / "variable_ids.json"
+    png_file = args.out / "mlg_memory_operations.png"
+
+    seq_file.write_text(json.dumps(sequence, indent=2), encoding="utf-8")
+    ops_file.write_text(json.dumps([asdict(x) for x in operations], indent=2), encoding="utf-8")
+    ids_file.write_text(json.dumps(extractor.var_ids, indent=2), encoding="utf-8")
+    draw_graph(operations, png_file, args.dpi)
+
+    print("\\n=== Expanded execution sequence ===")
+    for i, item in enumerate(sequence, 1):
+        print(f"{i:>3}. [{item['function']}:L{item['line']}] {item['statement']}")
+
+    print("\\n=== Extracted MLG operations (malloc/use/free are primary) ===")
+    for op in operations:
+        if op.kind == "alias":
+            print(f"{op.step:>3}. alias: {op.source} (ID {op.source_id}) -> "
+                  f"{op.variable} (ID {op.var_id}) [{op.function}:L{op.line}]")
+        else:
+            print(f"{op.step:>3}. {op.kind}: {op.variable} (Var-ID {op.var_id}) "
+                  f"[{op.function}:L{op.line}]")
+
+    print("\\nOutput files:")
+    print(f"  Execution sequence: {seq_file}")
+    print(f"  MLG operations:     {ops_file}")
+    print(f"  Variable IDs:       {ids_file}")
+    print(f"  MLG drawing:        {png_file}")
+
+
+if __name__ == "__main__":
+    main()
