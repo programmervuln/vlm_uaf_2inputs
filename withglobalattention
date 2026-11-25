@@ -1,0 +1,690 @@
+# -*- coding: utf-8 -*-
+"""
+MLG-UAF: CodeBERT embeddings + 6 Longformer-initialized local-attention layers
+        + 4 Longformer-initialized MoBA Top-K layers + ViT-B/16 visual branch.
+
+Recommended research configuration, not a claim of empirically highest accuracy.
+Run:
+  python train_mlg_uaf_codebert_longformer_moba.py --arch full
+  python train_mlg_uaf_codebert_longformer_moba.py --arch text-only
+
+Dependencies:
+  pip install torch torchvision transformers scikit-learn pandas pillow tqdm
+"""
+
+import os
+import math
+import random
+import argparse
+import logging
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+
+from transformers import AutoTokenizer, RobertaModel, LongformerModel
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix
+)
+
+# ----------------------------- Configuration -----------------------------
+
+CODE_MODEL_NAME = "microsoft/codebert-base"
+LONGFORMER_INIT_NAME = "allenai/longformer-base-4096"
+
+IMG_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images"
+META_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta"
+CODE_ROOT = "/zhangliqiang/clip/copyfolder/vlm0/genchangename"
+
+OUTPUT_DIR = "./mlg_uaf_codebert_longformer_moba"
+MAX_CODE_LENGTH = 512
+NUM_LONGFORMER_LAYERS = 6
+NUM_MOBA_LAYERS = 4
+NUM_HEADS = 12
+BLOCK_SIZE = 64
+LOCAL_WINDOW = 64
+TOP_K = 2
+PROJECTION_DIM = 512
+BATCH_SIZE = 2
+EPOCHS = 15
+LR = 2e-5
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.1
+PATIENCE = 4
+NUM_WORKERS = 0
+SEED = 42
+
+MEMORY_API_PATTERN = re.compile(
+    r"\b(?:malloc|calloc|realloc|reallocarray|free|free_sized|new|delete|"
+    r"operator\s+new|operator\s+delete|kfree|kvfree|vfree|kmalloc|kzalloc|"
+    r"krealloc|memcpy|memmove|memset|HeapAlloc|HeapFree|g_malloc|g_free|"
+    r"RelinquishMagickMemory|MagickFree)\b", re.IGNORECASE
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("MLG-UAF")
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_label(image_name):
+    # Existing dataset convention: 0=UAF, 1=Non-UAF.
+    if "-0-" in image_name:
+        return 0
+    if "-1-" in image_name:
+        return 1
+    return None
+
+
+# ----------------------------- Dataset -----------------------------------
+
+class UAFMultimodalDataset(Dataset):
+    def __init__(self, img_root, meta_root, code_root, is_train,
+                 tokenizer, transform, max_length=MAX_CODE_LENGTH):
+        self.img_paths, self.code_paths = [], []
+        self.labels, self.image_names = [], []
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.max_length = max_length
+
+        split_name = "train.txt" if is_train else "val.txt"
+        split_file = os.path.join(meta_root, split_name)
+        if not os.path.isfile(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+
+        missing_images, missing_codes, unknown_labels = 0, 0, 0
+        with open(split_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                image_name = line.split(",")[0].strip()
+                label = resolve_label(image_name)
+                if label is None:
+                    unknown_labels += 1
+                    continue
+
+                image_path = os.path.join(img_root, "uaf", image_name)
+                code_name = image_name.replace("gen", "").replace(".jpg", ".c")
+                code_path = os.path.join(code_root, code_name)
+
+                if not os.path.isfile(image_path):
+                    missing_images += 1
+                    continue
+                if not os.path.isfile(code_path):
+                    missing_codes += 1
+                    continue
+
+                self.img_paths.append(image_path)
+                self.code_paths.append(code_path)
+                self.labels.append(label)
+                self.image_names.append(image_name)
+
+        if not self.labels:
+            raise RuntimeError(
+                f"No valid image/code pairs in {split_file}. Check paths and filenames."
+            )
+
+        logger.info(
+            "%s: %d samples | UAF=%d | Non-UAF=%d | missing images=%d | "
+            "missing code=%d | unknown labels=%d",
+            "Train" if is_train else "Validation",
+            len(self.labels), sum(x == 0 for x in self.labels),
+            sum(x == 1 for x in self.labels), missing_images, missing_codes,
+            unknown_labels
+        )
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        with Image.open(self.img_paths[idx]) as im:
+            image = self.transform(im.convert("RGB"))
+
+        with open(self.code_paths[idx], "r", encoding="utf-8", errors="ignore") as f:
+            code = f.read()
+
+        enc = self.tokenizer(
+            code,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_offsets_mapping=True,
+            return_tensors="pt"
+        )
+        input_ids = enc["input_ids"].squeeze(0)
+        attention_mask = enc["attention_mask"].squeeze(0)
+        offsets = enc["offset_mapping"].squeeze(0)
+
+        # Global tokens: BOS/CLS plus source tokens overlapping known
+        # memory-management API names. This is an explicit heuristic rule.
+        global_attention_mask = torch.zeros_like(input_ids)
+        valid_positions = torch.nonzero(attention_mask, as_tuple=False).flatten()
+        if len(valid_positions) > 0:
+            global_attention_mask[valid_positions[0]] = 1
+
+        for match in MEMORY_API_PATTERN.finditer(code):
+            start, end = match.span()
+            overlap = (
+                (offsets[:, 0] < end) &
+                (offsets[:, 1] > start) &
+                attention_mask.bool()
+            )
+            global_attention_mask[overlap] = 1
+
+        return {
+            "image": image,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "global_attention_mask": global_attention_mask,
+            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+            "image_name": self.image_names[idx],
+        }
+
+
+# ----------------------------- Attention ---------------------------------
+
+def copy_linear(dst, src):
+    if dst.weight.shape != src.weight.shape:
+        raise ValueError(f"Linear shape mismatch: {dst.weight.shape} vs {src.weight.shape}")
+    with torch.no_grad():
+        dst.weight.copy_(src.weight)
+        if dst.bias is not None and src.bias is not None:
+            dst.bias.copy_(src.bias)
+
+
+def copy_layer_norm(dst, src):
+    with torch.no_grad():
+        dst.weight.copy_(src.weight)
+        dst.bias.copy_(src.bias)
+
+
+class RoutedAttentionBlock(nn.Module):
+    """
+    Multi-head attention with either:
+      - local sliding-window mask (Longformer-style local attention), or
+      - MoBA-style Top-K block routing.
+
+    This is a transparent research implementation of block Top-K routing.
+    It is not claimed to be an exact reproduction of every MoBA reference
+    implementation detail.
+    """
+    def __init__(self, hidden_size, num_heads, mode, block_size=64,
+                 local_window=64, top_k=2, dropout=0.1):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.mode = mode
+        self.block_size = block_size
+        self.local_window = local_window
+        self.top_k = top_k
+        self.q = nn.Linear(hidden_size, hidden_size)
+        self.k = nn.Linear(hidden_size, hidden_size)
+        self.v = nn.Linear(hidden_size, hidden_size)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        self.dropout = dropout
+
+    def _split_heads(self, x):
+        b, length, _ = x.shape
+        return x.view(b, length, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _local_mask(self, attention_mask, global_attention_mask, length, device):
+        pos = torch.arange(length, device=device)
+        left = self.local_window // 2
+        right = self.local_window - left
+        relative = pos[None, :] - pos[:, None]
+        local = (relative >= -left) & (relative < right)
+        global_tokens = global_attention_mask.bool()
+        global_keys = global_tokens[:, None, None, :]
+        global_queries = global_tokens[:, None, :, None]
+        key_valid = attention_mask[:, None, None, :].bool()
+        return (local[None, None, :, :] | global_keys | global_queries) & key_valid
+
+    def _moba_mask(self, q, k, attention_mask, global_attention_mask):
+        # q/k: [B, H, L, D]. Route each query block to Top-K key blocks.
+        b, h, length, d = q.shape
+        if length % self.block_size != 0:
+            raise ValueError(
+                f"Sequence length {length} must be divisible by block size {self.block_size}"
+            )
+        n_blocks = length // self.block_size
+        q_blk = q.view(b, h, n_blocks, self.block_size, d).mean(dim=3)
+        k_blk = k.view(b, h, n_blocks, self.block_size, d).mean(dim=3)
+        route_scores = torch.matmul(q_blk, k_blk.transpose(-1, -2)) / math.sqrt(d)
+
+        k_block_valid = attention_mask.view(b, n_blocks, self.block_size).any(dim=-1)
+        route_scores = route_scores.masked_fill(
+            ~k_block_valid[:, None, None, :], torch.finfo(route_scores.dtype).min
+        )
+        k_keep = min(self.top_k, n_blocks)
+        selected = route_scores.topk(k_keep, dim=-1).indices
+        route = torch.zeros_like(route_scores, dtype=torch.bool)
+        route.scatter_(-1, selected, True)
+
+        # Expand [B,H,Qblock,Kblock] routing decisions to token-level mask.
+        token_route = route.repeat_interleave(self.block_size, dim=2)
+        token_route = token_route.repeat_interleave(self.block_size, dim=3)
+        global_tokens = global_attention_mask.bool()
+        global_keys = global_tokens[:, None, None, :]
+        global_queries = global_tokens[:, None, :, None]
+        token_route = token_route | global_keys | global_queries
+        key_valid = attention_mask[:, None, None, :].bool()
+        return token_route & key_valid
+
+    def forward(self, x, attention_mask, global_attention_mask):
+        b, length, _ = x.shape
+        q = self._split_heads(self.q(x))
+        k = self._split_heads(self.k(x))
+        v = self._split_heads(self.v(x))
+
+        if self.mode == "local":
+            mask = self._local_mask(
+                attention_mask, global_attention_mask, length, x.device
+            )
+        elif self.mode == "moba":
+            mask = self._moba_mask(
+                q, k, attention_mask, global_attention_mask
+            )
+        else:
+            raise ValueError(f"Unknown attention mode: {self.mode}")
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0
+        )
+        out = out.transpose(1, 2).contiguous().view(b, length, self.hidden_size)
+        return self.out(out)
+
+
+class HybridTransformerLayer(nn.Module):
+    """RoBERTa/Longformer-compatible Transformer layer with replaceable attention."""
+    def __init__(self, hidden_size, intermediate_size, num_heads, mode,
+                 layer_norm_eps=1e-5, dropout=0.1):
+        super().__init__()
+        self.attn = RoutedAttentionBlock(
+            hidden_size, num_heads, mode,
+            block_size=BLOCK_SIZE, local_window=LOCAL_WINDOW,
+            top_k=TOP_K, dropout=dropout
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.ffn_in = nn.Linear(hidden_size, intermediate_size)
+        self.ffn_out = nn.Linear(intermediate_size, hidden_size)
+        self.ffn_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+
+    def forward(self, x, attention_mask, global_attention_mask):
+        a = self.attn(x, attention_mask, global_attention_mask)
+        x = self.attn_norm(x + self.attn_dropout(a))
+        z = self.ffn_out(F.gelu(self.ffn_in(x)))
+        x = self.ffn_norm(x + self.ffn_dropout(z))
+        return x
+
+    def init_from_longformer_layer(self, source_layer):
+        src_attn = source_layer.attention.self
+        copy_linear(self.attn.q, src_attn.query)
+        copy_linear(self.attn.k, src_attn.key)
+        copy_linear(self.attn.v, src_attn.value)
+        copy_linear(self.attn.out, source_layer.attention.output.dense)
+        copy_layer_norm(self.attn_norm, source_layer.attention.output.LayerNorm)
+        copy_linear(self.ffn_in, source_layer.intermediate.dense)
+        copy_linear(self.ffn_out, source_layer.output.dense)
+        copy_layer_norm(self.ffn_norm, source_layer.output.LayerNorm)
+
+
+# ----------------------------- Model -------------------------------------
+
+class CodeBERTLongformerMoBA(nn.Module):
+    def __init__(self, use_visual=True, pretrained_vit=True):
+        super().__init__()
+        logger.info("Loading CodeBERT embeddings: %s", CODE_MODEL_NAME)
+        codebert = RobertaModel.from_pretrained(CODE_MODEL_NAME)
+        self.embeddings = codebert.embeddings
+        hidden = codebert.config.hidden_size
+        intermediate = codebert.config.intermediate_size
+        heads = codebert.config.num_attention_heads
+        eps = codebert.config.layer_norm_eps
+
+        logger.info("Loading Longformer initialization weights: %s", LONGFORMER_INIT_NAME)
+        longformer = LongformerModel.from_pretrained(LONGFORMER_INIT_NAME)
+        if longformer.config.hidden_size != hidden:
+            raise ValueError("CodeBERT and Longformer hidden sizes must match.")
+        if longformer.config.num_attention_heads != heads:
+            raise ValueError("CodeBERT and Longformer head counts must match.")
+
+        source_layers = longformer.encoder.layer
+        self.layers = nn.ModuleList()
+        for i in range(NUM_LONGFORMER_LAYERS):
+            layer = HybridTransformerLayer(
+                hidden, intermediate, heads, mode="local",
+                layer_norm_eps=eps, dropout=DROPOUT
+            )
+            layer.init_from_longformer_layer(source_layers[i])
+            self.layers.append(layer)
+
+        for i in range(NUM_MOBA_LAYERS):
+            layer = HybridTransformerLayer(
+                hidden, intermediate, heads, mode="moba",
+                layer_norm_eps=eps, dropout=DROPOUT
+            )
+            layer.init_from_longformer_layer(
+                source_layers[NUM_LONGFORMER_LAYERS + i]
+            )
+            self.layers.append(layer)
+
+        del codebert
+        del longformer
+
+        self.hidden_size = hidden
+        self.norm = nn.LayerNorm(hidden, eps=eps)
+        self.dropout = nn.Dropout(DROPOUT)
+        self.use_visual = use_visual
+
+        self.code_projection = nn.Sequential(
+            nn.Linear(hidden, PROJECTION_DIM),
+            nn.LayerNorm(PROJECTION_DIM),
+            nn.GELU(),
+            nn.Dropout(0.3)
+        )
+
+        if use_visual:
+            weights = ViT_B_16_Weights.DEFAULT if pretrained_vit else None
+            self.vit = vit_b_16(weights=weights)
+            vit_dim = self.vit.heads.head.in_features
+            self.vit.heads = nn.Identity()
+            self.image_projection = nn.Sequential(
+                nn.Linear(vit_dim, PROJECTION_DIM),
+                nn.LayerNorm(PROJECTION_DIM),
+                nn.GELU(),
+                nn.Dropout(0.3)
+            )
+            fusion_dim = PROJECTION_DIM * 2
+        else:
+            self.vit = None
+            self.image_projection = None
+            fusion_dim = PROJECTION_DIM
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 2)
+        )
+
+    def forward(self, images, input_ids, attention_mask, global_attention_mask):
+        # CodeBERT token embeddings; Longformer-initialized hybrid encoder.
+        x = self.embeddings(input_ids=input_ids)
+        x = self.dropout(x)
+        for layer in self.layers:
+            x = layer(x, attention_mask, global_attention_mask)
+        x = self.norm(x)
+
+        mask = attention_mask.unsqueeze(-1).to(x.dtype)
+        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        code_feat = self.code_projection(pooled)
+
+        features = [code_feat]
+        if self.use_visual:
+            image_feat = self.image_projection(self.vit(images))
+            features.append(image_feat)
+
+        fused = torch.cat(features, dim=1)
+        return self.classifier(fused)
+
+
+# ----------------------------- Training ----------------------------------
+
+def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None,
+              desc=""):
+    training = optimizer is not None
+    model.train(training)
+    losses, y_true, y_pred = [], [], []
+
+    pbar = tqdm(loader, desc=desc)
+    for batch in pbar:
+        images = batch["image"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        global_attention_mask = batch["global_attention_mask"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(training):
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                logits = model(images, input_ids, attention_mask, global_attention_mask)
+                loss = criterion(logits, labels)
+
+            if training:
+                if scaler is not None and device.type == "cuda":
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+        losses.append(float(loss.detach().cpu()))
+        preds = logits.argmax(dim=1)
+        y_true.extend(labels.detach().cpu().tolist())
+        y_pred.extend(preds.detach().cpu().tolist())
+
+        running_acc = accuracy_score(y_true, y_pred)
+        pbar.set_postfix(loss=f"{np.mean(losses):.4f}", acc=f"{running_acc:.4f}")
+
+    return {
+        "loss": float(np.mean(losses)),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision_macro": precision_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "recall_macro": recall_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "f1_macro": f1_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "f1_uaf": f1_score(
+            y_true, y_pred, pos_label=0, average="binary", zero_division=0
+        ),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
+    }
+
+
+def save_predictions(model, loader, device, output_csv):
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Saving predictions"):
+            images = batch["image"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            global_attention_mask = batch["global_attention_mask"].to(device)
+            logits = model(images, input_ids, attention_mask, global_attention_mask)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            preds = probs.argmax(axis=1)
+            for i, pred in enumerate(preds):
+                true = int(batch["label"][i])
+                rows.append({
+                    "image_name": batch["image_name"][i],
+                    "ground_truth": true,
+                    "ground_truth_name": "UAF" if true == 0 else "Non-UAF",
+                    "prediction": int(pred),
+                    "prediction_name": "UAF" if pred == 0 else "Non-UAF",
+                    "prob_uaf": float(probs[i, 0]),
+                    "prob_non_uaf": float(probs[i, 1])
+                })
+    pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
+    logger.info("Saved predictions: %s", output_csv)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--img-root", default=IMG_ROOT)
+    parser.add_argument("--meta-root", default=META_ROOT)
+    parser.add_argument("--code-root", default=CODE_ROOT)
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--max-length", type=int, default=MAX_CODE_LENGTH)
+    parser.add_argument("--text-only", action="store_true")
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--seed", type=int, default=SEED)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+    if device.type == "cuda":
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+
+    tokenizer = AutoTokenizer.from_pretrained(CODE_MODEL_NAME)
+    image_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225)
+        )
+    ])
+
+    train_ds = UAFMultimodalDataset(
+        args.img_root, args.meta_root, args.code_root, True,
+        tokenizer, image_transform, args.max_length
+    )
+    val_ds = UAFMultimodalDataset(
+        args.img_root, args.meta_root, args.code_root, False,
+        tokenizer, image_transform, args.max_length
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=(device.type == "cuda")
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=(device.type == "cuda")
+    )
+
+    model = CodeBERTLongformerMoBA(
+        use_visual=not args.text_only,
+        pretrained_vit=True
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    ckpt_path = os.path.join(args.output_dir, "best_model.pth")
+    pred_path = os.path.join(args.output_dir, "validation_predictions.csv")
+
+    if args.eval_only:
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+    else:
+        best_f1 = -1.0
+        stale = 0
+        for epoch in range(args.epochs):
+            train_metrics = run_epoch(
+                model, train_loader, criterion, device,
+                optimizer=optimizer, scaler=scaler,
+                desc=f"Train {epoch + 1}/{args.epochs}"
+            )
+            val_metrics = run_epoch(
+                model, val_loader, criterion, device,
+                desc=f"Validation {epoch + 1}/{args.epochs}"
+            )
+            logger.info(
+                "Epoch %02d | train loss %.4f acc %.4f macro-F1 %.4f UAF-F1 %.4f "
+                "| val loss %.4f acc %.4f macro-F1 %.4f UAF-F1 %.4f CM=%s",
+                epoch + 1,
+                train_metrics["loss"], train_metrics["accuracy"],
+                train_metrics["f1_macro"], train_metrics["f1_uaf"],
+                val_metrics["loss"], val_metrics["accuracy"],
+                val_metrics["f1_macro"], val_metrics["f1_uaf"],
+                val_metrics["confusion_matrix"]
+            )
+
+            # Select checkpoint by macro-F1 to avoid majority-class bias.
+            if val_metrics["f1_macro"] > best_f1:
+                best_f1 = val_metrics["f1_macro"]
+                stale = 0
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "epoch": epoch + 1,
+                    "best_val_macro_f1": best_f1,
+                    "config": {
+                        "code_model": CODE_MODEL_NAME,
+                        "longformer_init": LONGFORMER_INIT_NAME,
+                        "longformer_layers": NUM_LONGFORMER_LAYERS,
+                        "moba_layers": NUM_MOBA_LAYERS,
+                        "block_size": BLOCK_SIZE,
+                        "top_k": TOP_K,
+                        "local_window": LOCAL_WINDOW,
+                        "max_length": args.max_length,
+                        "text_only": args.text_only
+                    }
+                }, ckpt_path)
+                logger.info("Saved best checkpoint: %s", ckpt_path)
+            else:
+                stale += 1
+                if stale >= PATIENCE:
+                    logger.info("Early stopping after %d stale epochs", PATIENCE)
+                    break
+
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        logger.info(
+            "Loaded best epoch %s, validation macro-F1 %.4f",
+            checkpoint["epoch"], checkpoint["best_val_macro_f1"]
+        )
+
+    final_metrics = run_epoch(
+        model, val_loader, criterion, device, desc="Final validation"
+    )
+    logger.info("Final validation metrics: %s", final_metrics)
+    save_predictions(model, val_loader, device, pred_path)
+
+
+if __name__ == "__main__":
+    main()
